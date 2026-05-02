@@ -2,47 +2,26 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const OpenAI = require("openai");
+const { google } = require("googleapis");
 
 const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 
-const DEFAULT_ALLOWED_CATEGORIES = [
-  "Shopping",
-  "Транспорт",
-  "Utilities",
-  "Развлечения",
-  "Рестораны",
-  "Семья и персонал",
-  "Расходы Персонал",
-  "Прочее",
-  "Связь и подписки",
-  "Путешествия",
-  "Здоровье",
-  "Образование",
-  "Аренда",
-  "Мед. страховка",
-  "CAPEX",
-  "Credit Cards",
-  "Доходы",
-];
+const INCOME_SHEET = (process.env.INCOME_SHEET_NAME || "Income").trim();
+const RAW_SHEET = (process.env.RAW_SHEET_NAME || "Expenses_RAW").trim();
+/** Dashboard tab: never used as a category target or written by the logger. */
+const SUMMARY_TAB = (process.env.GOOGLE_SUMMARY_TAB || "Summary").trim();
+const DEFAULT_CURRENCY = (process.env.DEFAULT_EXPENSE_CURRENCY || "HKD").trim();
 
-const INCOME_SHEET = "Доходы";
-const RAW_SHEET = "Expenses_RAW";
-const ALLOWED_CATEGORIES = (
-  process.env.ALLOWED_CATEGORIES || DEFAULT_ALLOWED_CATEGORIES.join("|")
-)
-  .split("|")
-  .map((value) => value.trim())
-  .filter(Boolean);
+/** Filled at startup from the spreadsheet (tab titles minus skip list). */
+let allowedCategories = [];
 
-if (!ALLOWED_CATEGORIES.includes(INCOME_SHEET)) {
-  ALLOWED_CATEGORIES.push(INCOME_SHEET);
-}
+/** Lowercase alias → exact tab title; from CATEGORY_MAPPING JSON in .env */
+let categoryAliasMap = new Map();
 
 const TELEGRAM_API_BASE = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
-const GRAPH_API_BASE = "https://graph.microsoft.com/v1.0";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -54,14 +33,137 @@ function getIsoParts(date) {
   return { isoDate, time };
 }
 
-function escapeSheetName(sheetName) {
-  return sheetName.replace(/'/g, "''");
+function escapeGoogleSheetRangeTitle(sheetName) {
+  return `'${sheetName.replace(/'/g, "''")}'`;
+}
+
+function createGoogleSheetsClient() {
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_OAUTH_REDIRECT_URI || "http://127.0.0.1:3001/oauth/callback"
+  );
+  oauth2Client.setCredentials({
+    refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+  });
+  return google.sheets({ version: "v4", auth: oauth2Client });
+}
+
+function parseSkipTabNames() {
+  const extra = (process.env.GOOGLE_SKIP_TABS || "")
+    .split(/[|,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return new Set(extra);
+}
+
+function parseCategoryMappingEnv() {
+  const raw = (process.env.CATEGORY_MAPPING || "").trim();
+  if (!raw) return new Map();
+  try {
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return new Map();
+    const map = new Map();
+    for (const [key, val] of Object.entries(obj)) {
+      if (typeof key !== "string" || typeof val !== "string") continue;
+      const k = key.trim().toLowerCase();
+      const v = val.trim();
+      if (k && v) map.set(k, v);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Map model output to an allowed sheet tab: exact match, alias (CATEGORY_MAPPING), or case-insensitive tab match.
+ */
+function resolveCategoryToSheet(name, categories) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) {
+    throw new Error("Empty category");
+  }
+  if (categories.includes(trimmed)) {
+    return trimmed;
+  }
+  const aliasTarget = categoryAliasMap.get(trimmed.toLowerCase());
+  if (aliasTarget && categories.includes(aliasTarget)) {
+    return aliasTarget;
+  }
+  const lower = trimmed.toLowerCase();
+  const ci = categories.find((c) => c.toLowerCase() === lower);
+  if (ci) {
+    return ci;
+  }
+  throw new Error(`Unsupported category: ${trimmed}`);
+}
+
+function formatDateDdMmYyyy(date) {
+  const d = date.getDate().toString().padStart(2, "0");
+  const m = (date.getMonth() + 1).toString().padStart(2, "0");
+  const y = date.getFullYear();
+  return `${d}/${m}/${y}`;
+}
+
+async function fetchSpreadsheetTabTitles(sheets, spreadsheetId) {
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(title))",
+  });
+  const sheetsList = meta.data.sheets || [];
+  return sheetsList
+    .map((s) => s.properties && s.properties.title)
+    .filter(Boolean);
+}
+
+/**
+ * Tabs the model may choose as the expense/income *category* (real sheet to log under).
+ * RAW is omitted on purpose: it is not a category—every transaction is always appended to
+ * RAW_SHEET separately as the full audit trail (see webhook). Summary is the dashboard.
+ */
+function buildAllowedCategoriesFromTabs(allTitles) {
+  const skip = parseSkipTabNames();
+  skip.add(RAW_SHEET);
+  if (SUMMARY_TAB) skip.add(SUMMARY_TAB);
+  return allTitles.filter((t) => !skip.has(t));
+}
+
+async function logFirstRow(sheets, spreadsheetId, sheetLabel, sheetName) {
+  try {
+    const range = `${escapeGoogleSheetRangeTitle(sheetName)}!1:1`;
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range,
+    });
+    const row = res.data.values && res.data.values[0];
+    console.log(
+      `[structure] ${sheetLabel} "${sheetName}" row1:`,
+      row && row.length ? row.join(" | ") : "(empty)"
+    );
+  } catch (err) {
+    console.warn(`[structure] Could not read row1 of "${sheetName}": ${err.message}`);
+  }
+}
+
+async function appendRowToGoogleSheet(sheets, spreadsheetId, sheetName, rowValues) {
+  const range = `${escapeGoogleSheetRangeTitle(sheetName)}!A:Z`;
+  await sheets.spreadsheets.values.append({
+    spreadsheetId,
+    range,
+    valueInputOption: "USER_ENTERED",
+    insertDataOption: "INSERT_ROWS",
+    requestBody: {
+      values: [rowValues],
+    },
+  });
 }
 
 function buildPrompt(messageText) {
-  const categoryList = ALLOWED_CATEGORIES.join(", ");
+  const categoryList = allowedCategories.join(", ");
   return [
-    `Extract from this message: (1) numeric amount, (2) description, (3) category (choose ONE from: ${categoryList}), and (4) type (expense or income).`,
+    `Extract from this message: (1) numeric amount, (2) description, (3) category (use the exact sheet name from: ${categoryList}, or a close synonym—synonyms are mapped automatically), and (4) type (expense or income).`,
+    `Never use "${RAW_SHEET}" or any universal/log tab as category—the app logs every message there automatically with full detail.`,
     'Return ONLY a JSON object: {"amount": number, "description": string, "category": string, "type": string}.',
     'Example: {"amount": 250, "description": "groceries", "category": "Shopping", "type": "expense"}',
     "",
@@ -77,38 +179,14 @@ async function sendTelegramMessage(chatId, text, replyToMessageId) {
   });
 }
 
-async function getMicrosoftAccessToken() {
-  const tokenUrl = `https://login.microsoftonline.com/${process.env.MS_TENANT_ID}/oauth2/v2.0/token`;
-  const params = new URLSearchParams({
-    client_id: process.env.MS_CLIENT_ID,
-    client_secret: process.env.MS_CLIENT_SECRET,
-    grant_type: "client_credentials",
-    scope: "https://graph.microsoft.com/.default",
-  });
-
-  const response = await axios.post(tokenUrl, params, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
-  return response.data.access_token;
-}
-
-async function appendRowToSheet(accessToken, sheetName, rowValues) {
-  const url = `${GRAPH_API_BASE}/drives/${process.env.ONEDRIVE_DRIVE_ID}/items/${process.env.EXCEL_FILE_ID}/workbook/worksheets('${escapeSheetName(sheetName)}')/tables('${process.env.EXCEL_TABLE_NAME_PREFIX}${sheetName}')/rows/add`;
-  await axios.post(
-    url,
-    { values: [rowValues] },
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
-}
-
 async function parseWithOpenAI(messageText) {
+  const today = new Date().toISOString().slice(0, 10);
   const completion = await openai.responses.create({
     model: process.env.OPENAI_MODEL || "gpt-5.5-medium",
     input: [
       {
         role: "system",
-        content:
-          "You are a financial parsing assistant. Extract expense/income amounts and determine the most appropriate category. For incoming payments/transfers, set type to 'income' and category to 'Доходы'. For outgoing expenses, set type to 'expense' and use the expense categories provided. Today's date is 2026-05-01. Output strict JSON only.",
+        content: `You are a financial parsing assistant. Extract expense/income amounts and determine the most appropriate category. For incoming payments/transfers, set type to 'income' and category to '${INCOME_SHEET}'. For outgoing expenses, set type to 'expense' and use one of the expense category tabs provided. Today's date is ${today}. Output strict JSON only.`,
       },
       {
         role: "user",
@@ -124,7 +202,7 @@ async function parseWithOpenAI(messageText) {
           properties: {
             amount: { type: "number" },
             description: { type: "string" },
-            category: { type: "string", enum: ALLOWED_CATEGORIES },
+            category: { type: "string" },
             type: { type: "string", enum: ["expense", "income"] },
           },
           required: ["amount", "description", "category", "type"],
@@ -151,17 +229,78 @@ function normalizeResult(result) {
     throw new Error("No valid amount extracted");
   }
 
-  if (!ALLOWED_CATEGORIES.includes(normalized.category)) {
-    throw new Error(`Unsupported category: ${normalized.category}`);
-  }
-
   if (normalized.type === "income") {
     normalized.category = INCOME_SHEET;
   } else if (normalized.type !== "expense") {
     throw new Error(`Unsupported type: ${normalized.type}`);
+  } else {
+    normalized.category = resolveCategoryToSheet(normalized.category, allowedCategories);
   }
 
   return normalized;
+}
+
+function requireEnv(name) {
+  const v = process.env[name];
+  if (!v || !String(v).trim()) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+}
+
+async function bootstrap() {
+  requireEnv("GOOGLE_SPREADSHEET_ID");
+  requireEnv("GOOGLE_CLIENT_ID");
+  requireEnv("GOOGLE_CLIENT_SECRET");
+  requireEnv("GOOGLE_REFRESH_TOKEN");
+
+  const sheets = createGoogleSheetsClient();
+  const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID;
+
+  const tabTitles = await fetchSpreadsheetTabTitles(sheets, spreadsheetId);
+  if (!tabTitles.length) {
+    throw new Error("Spreadsheet has no sheet tabs.");
+  }
+
+  if (!tabTitles.includes(RAW_SHEET)) {
+    throw new Error(
+      `RAW tab "${RAW_SHEET}" not found. Available tabs: ${tabTitles.join(", ")}. Set RAW_SHEET_NAME in .env.`
+    );
+  }
+
+  if (!tabTitles.includes(INCOME_SHEET)) {
+    throw new Error(
+      `Income tab "${INCOME_SHEET}" not found. Available tabs: ${tabTitles.join(", ")}. Set INCOME_SHEET_NAME in .env.`
+    );
+  }
+
+  categoryAliasMap = parseCategoryMappingEnv();
+  allowedCategories = buildAllowedCategoriesFromTabs(tabTitles);
+
+  if (!allowedCategories.length) {
+    throw new Error(
+      "No category tabs after exclusions. Check GOOGLE_SKIP_TABS and RAW_SHEET_NAME."
+    );
+  }
+
+  if (!allowedCategories.includes(INCOME_SHEET)) {
+    throw new Error(
+      `Income tab "${INCOME_SHEET}" was excluded. Remove it from GOOGLE_SKIP_TABS if listed there.`
+    );
+  }
+
+  console.log(
+    `Budget logger: ${allowedCategories.length} category targets (sheet tabs the model may choose) — ${allowedCategories.join(", ")}`
+  );
+  console.log(
+    `Universal RAW log (every transaction is appended here; not a category option): "${RAW_SHEET}"`
+  );
+  if (categoryAliasMap.size) {
+    console.log(`Category aliases loaded: ${categoryAliasMap.size}`);
+  }
+
+  await logFirstRow(sheets, spreadsheetId, "RAW log", RAW_SHEET);
+  const sampleCategoryTab = allowedCategories.find((t) => t !== INCOME_SHEET) || INCOME_SHEET;
+  await logFirstRow(sheets, spreadsheetId, "Sample category", sampleCategoryTab);
 }
 
 app.post("/webhook/telegram", async (req, res) => {
@@ -200,21 +339,22 @@ app.post("/webhook/telegram", async (req, res) => {
     ];
 
     const rawRow = [
-      now.toISOString().replace("T", " ").slice(0, 19),
-      sender,
-      originalMessage,
-      aiResult.amount,
-      aiResult.type,
+      formatDateDdMmYyyy(now),
+      aiResult.type === "income" ? "Income" : "Expense",
       categorySheetName,
+      "",
       aiResult.description,
-      isoDate,
-      time,
+      "",
+      aiResult.amount,
+      DEFAULT_CURRENCY,
+      aiResult.amount,
+      `Telegram — ${sender}: ${originalMessage}`,
     ];
 
-    const token = await getMicrosoftAccessToken();
-
-    await appendRowToSheet(token, categorySheetName, categoryRow);
-    await appendRowToSheet(token, RAW_SHEET, rawRow);
+    const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID;
+    const sheets = createGoogleSheetsClient();
+    await appendRowToGoogleSheet(sheets, spreadsheetId, RAW_SHEET, rawRow);
+    await appendRowToGoogleSheet(sheets, spreadsheetId, categorySheetName, categoryRow);
 
     await sendTelegramMessage(
       chatId,
@@ -225,7 +365,7 @@ app.post("/webhook/telegram", async (req, res) => {
     try {
       await sendTelegramMessage(
         chatId,
-        "❌ Error saving to Excel. Please check the workbook access and try again.",
+        "❌ Error saving to the spreadsheet. Please check access and try again.",
         messageId
       );
     } catch (notifyError) {
@@ -240,6 +380,13 @@ app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.listen(PORT, () => {
-  console.log(`Budget logger is running on port ${PORT}`);
-});
+bootstrap()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Budget logger is running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Startup failed:", err.message);
+    process.exit(1);
+  });

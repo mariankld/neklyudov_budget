@@ -1,11 +1,11 @@
 # Neklyudov Budget Logger
 
-Telegram -> OpenAI -> Excel workflow that replaces the Gemini/Zapier parser with OpenAI and logs transactions to both:
+Telegram → OpenAI → **Google Sheets**. Parsed transactions are appended to:
 
-- category sheet (or `Доходы` for income)
-- `Expenses_RAW` (always)
+- the tab for the chosen category (or the income tab for `type=income`)
+- the RAW log tab (always)
 
-Success message is sent only if both Excel writes succeed.
+Categories are **not** hard-coded: on startup the app reads all sheet tab titles from your spreadsheet, skips the RAW tab and any names in `GOOGLE_SKIP_TABS`, and uses the rest for OpenAI’s category enum.
 
 ## 1) Install
 
@@ -23,68 +23,65 @@ Fill in:
 
 - `TELEGRAM_BOT_TOKEN`
 - `OPENAI_API_KEY`
-- `MS_TENANT_ID`, `MS_CLIENT_ID`, `MS_CLIENT_SECRET`
-- `ONEDRIVE_DRIVE_ID`
-- `EXCEL_FILE_ID`
+- `GOOGLE_SPREADSHEET_ID` (from the spreadsheet URL)
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REFRESH_TOKEN` (see below)
 
-## 3) Excel workbook requirement
+Set `INCOME_SHEET_NAME` and `RAW_SHEET_NAME` to match your workbook tab names exactly.
 
-This code appends rows through Microsoft Graph table API, so each destination sheet must contain a table.
+## 3) Google OAuth (refresh token)
 
-Expected table naming rule:
+```bash
+npm run google-oauth-setup
+```
 
-- `<EXCEL_TABLE_NAME_PREFIX><sheetName>`
+Open the printed URL, approve access, then copy the printed `GOOGLE_REFRESH_TOKEN` into `.env`.
 
-With default `EXCEL_TABLE_NAME_PREFIX=tbl_`, create tables named:
+The redirect URI in Google Cloud Console must match `GOOGLE_OAUTH_REDIRECT_URI` (default `http://127.0.0.1:3001/oauth/callback`).
 
-- `tbl_Доходы`
-- `tbl_Shopping`
-- `tbl_Транспорт`
-- `tbl_Utilities`
-- `tbl_Развлечения`
-- `tbl_Рестораны`
-- `tbl_Семья и персонал`
-- `tbl_Расходы Персонал`
-- `tbl_Прочее`
-- `tbl_Связь и подписки`
-- `tbl_Путешествия`
-- `tbl_Здоровье`
-- `tbl_Образование`
-- `tbl_Аренда`
-- `tbl_Мед. страховка`
-- `tbl_CAPEX`
-- `tbl_Credit Cards`
-- `tbl_Expenses_RAW`
+## 4) List tabs (optional)
 
-## 4) Run
+```bash
+npm run list-sheet-tabs
+```
+
+Use this to confirm tab names before setting `INCOME_SHEET_NAME`, `RAW_SHEET_NAME`, and `GOOGLE_SKIP_TABS`.
+
+## 5) Run
 
 ```bash
 npm start
 ```
 
-Server endpoints:
+On startup the server logs the resolved category list and prints row 1 of the RAW tab and one sample category tab (for column alignment checks).
+
+Endpoints:
 
 - `POST /webhook/telegram` (Telegram webhook target)
 - `GET /health`
 
-## 5) Telegram webhook setup
+## 6) Telegram webhook
 
-Expose local server (for example with ngrok), then set webhook:
+Expose the server (for example with ngrok), then:
 
 ```bash
 curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
   -d "url=https://<your-public-url>/webhook/telegram"
 ```
 
-## Behavior implemented
+## Row shape appended by the app
 
-- Sends immediate placeholder: `⏳ Logging your transaction...`
-- Parses message with OpenAI into strict JSON:
-  - `amount`, `description`, `category`, `type`
-- Routes:
-  - `type=income` -> `Доходы`
-  - otherwise -> selected expense category sheet
-- Always logs to `Expenses_RAW`
-- Sends:
-  - success: `✅ Logged: ...` only after both writes succeed
-  - failure: `❌ Error saving to Excel...` on parse/Excel errors
+**Category tab:** date (ISO), time, amount, type, category name, description.
+
+**RAW tab:** UTC-ish datetime string, sender, original message, amount, type, category name, description, date, time.
+
+Align headers in the sheet with these columns or adjust the code if your layout differs.
+
+## Behavior
+
+- Placeholder: `⏳ Logging your transaction...`
+- OpenAI returns strict JSON: `amount`, `description`, `category`, `type`
+- `type=income` → row goes to `INCOME_SHEET_NAME`
+- `type=expense` → row goes to the selected category tab
+- Always appends to `RAW_SHEET_NAME`
+- Success only after both writes succeed
