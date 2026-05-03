@@ -23,7 +23,7 @@ let allowedCategories = [];
 
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** token -> { draft, originalMessage, sender, sourceMessageId, chatId, createdAt } */
+/** token -> { draft, originalMessage, sender, sourceMessageId, chatId, createdAt, messageThreadId? } */
 const pendingByToken = new Map();
 
 /** Successfully logged tokens (idempotency); same TTL as pending. token -> completedAt ms */
@@ -39,6 +39,47 @@ const awaitingEditByChat = new Map();
 let categoryAliasMap = new Map();
 
 const TELEGRAM_API_BASE = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+
+/** Telegram Bot API returns HTTP 200 with { ok: false } for most errors; axios does not throw. */
+async function callTelegramApi(method, body) {
+  try {
+    const res = await axios.post(`${TELEGRAM_API_BASE}/${method}`, body);
+    const data = res.data;
+    if (!data?.ok) {
+      throw new Error(data?.description || `Telegram ${method}: ${JSON.stringify(data)}`);
+    }
+    return data;
+  } catch (err) {
+    const desc = err.response?.data?.description;
+    if (desc) {
+      throw new Error(`Telegram ${method}: ${desc}`);
+    }
+    throw err;
+  }
+}
+
+/** Inline button callback_data must be 1–64 bytes (UTF-8). */
+function assertCallbackDataLength(callbackData) {
+  const n = Buffer.byteLength(String(callbackData), "utf8");
+  if (n < 1 || n > 64) {
+    throw new Error(`callback_data must be 1–64 bytes (got ${n}).`);
+  }
+}
+
+function buildConfirmKeyboard(token) {
+  const logData = `log:${token}`;
+  const editData = `edit:${token}`;
+  assertCallbackDataLength(logData);
+  assertCallbackDataLength(editData);
+  return {
+    inline_keyboard: [
+      [
+        { text: "Yes, log it", callback_data: logData },
+        { text: "Edit", callback_data: editData },
+      ],
+    ],
+  };
+}
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -284,10 +325,11 @@ function buildEditPrompt(currentDraft, editInstruction, originalMessage) {
   ].join("\n");
 }
 
-async function sendTelegramMessage(chatId, text, replyToMessageId, replyMarkup) {
+async function sendTelegramMessage(chatId, text, replyToMessageId, replyMarkup, extras = {}) {
   const body = {
     chat_id: chatId,
     text,
+    ...extras,
   };
   if (replyToMessageId != null) {
     body.reply_to_message_id = replyToMessageId;
@@ -295,27 +337,28 @@ async function sendTelegramMessage(chatId, text, replyToMessageId, replyMarkup) 
   if (replyMarkup) {
     body.reply_markup = replyMarkup;
   }
-  await axios.post(`${TELEGRAM_API_BASE}/sendMessage`, body);
+  await callTelegramApi("sendMessage", body);
 }
 
 async function answerCallbackQuery(callbackQueryId, text, showAlert) {
-  await axios.post(`${TELEGRAM_API_BASE}/answerCallbackQuery`, {
+  await callTelegramApi("answerCallbackQuery", {
     callback_query_id: callbackQueryId,
     text: text || undefined,
     show_alert: Boolean(showAlert),
   });
 }
 
-async function editTelegramMessage(chatId, messageId, text, replyMarkup) {
+async function editTelegramMessage(chatId, messageId, text, replyMarkup, extras = {}) {
   const body = {
     chat_id: chatId,
     message_id: messageId,
     text,
+    ...extras,
   };
   if (replyMarkup !== undefined) {
     body.reply_markup = replyMarkup;
   }
-  await axios.post(`${TELEGRAM_API_BASE}/editMessageText`, body);
+  await callTelegramApi("editMessageText", body);
 }
 
 function formatContextDateLabel(messageDate) {
@@ -646,9 +689,10 @@ function isCancelCommand(text) {
   return t === "/cancel" || t.startsWith("/cancel ");
 }
 
-async function processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate) {
+async function processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate, messageThreadId) {
   awaitingEditByChat.delete(chatId);
-  await sendTelegramMessage(chatId, "⏳ Analyzing your message...", messageId);
+  const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
+  await sendTelegramMessage(chatId, "⏳ Analyzing your message...", messageId, undefined, threadExtras);
 
   const parsed = await parseTransactionWithOpenAI(originalMessage, messageDate);
   const draft = normalizeDraft(parsed, messageDate);
@@ -664,22 +708,16 @@ async function processExpenseFlow(chatId, originalMessage, sender, messageId, me
     chatId,
     createdAt: Date.now(),
     messageDate,
+    messageThreadId,
   });
 
   const preview = formatDraftPreview(draft, categorySheetName);
-  const keyboard = {
-    inline_keyboard: [
-      [
-        { text: "Yes, log it", callback_data: `log:${token}` },
-        { text: "Edit", callback_data: `edit:${token}` },
-      ],
-    ],
-  };
+  const keyboard = buildConfirmKeyboard(token);
 
-  await sendTelegramMessage(chatId, preview, messageId, keyboard);
+  await sendTelegramMessage(chatId, preview, messageId, keyboard, threadExtras);
 }
 
-async function processEditInstruction(chatId, editText, messageId) {
+async function processEditInstruction(chatId, editText, messageId, messageThreadId) {
   const wait = awaitingEditByChat.get(chatId);
   if (!wait) {
     return false;
@@ -688,15 +726,25 @@ async function processEditInstruction(chatId, editText, messageId) {
   const entry = pendingByToken.get(wait.token);
   if (!entry) {
     awaitingEditByChat.delete(chatId);
+    const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
     await sendTelegramMessage(
       chatId,
       "That edit session expired. Send the expense again.",
-      messageId
+      messageId,
+      undefined,
+      threadExtras
     );
     return true;
   }
 
   prunePending();
+
+  const threadExtras =
+    messageThreadId != null
+      ? { message_thread_id: messageThreadId }
+      : entry.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : {};
 
   const flatDraft = {
     amount: entry.draft.amount,
@@ -710,7 +758,7 @@ async function processEditInstruction(chatId, editText, messageId) {
   };
 
   try {
-    await sendTelegramMessage(chatId, "⏳ Updating your draft...", messageId);
+    await sendTelegramMessage(chatId, "⏳ Updating your draft...", messageId, undefined, threadExtras);
     const parsed = await parseEditWithOpenAI(flatDraft, editText, entry.originalMessage);
     const draft = normalizeDraft(parsed, entry.messageDate);
     const categorySheetName = draft.category;
@@ -725,40 +773,41 @@ async function processEditInstruction(chatId, editText, messageId) {
       chatId,
       createdAt: Date.now(),
       messageDate: entry.messageDate,
+      messageThreadId: entry.messageThreadId,
     });
     awaitingEditByChat.delete(chatId);
 
     const preview = formatDraftPreview(draft, categorySheetName);
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: "Yes, log it", callback_data: `log:${newToken}` },
-          { text: "Edit", callback_data: `edit:${newToken}` },
-        ],
-      ],
-    };
+    const keyboard = buildConfirmKeyboard(newToken);
 
-    await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard);
+    await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard, threadExtras);
   } catch (err) {
     await sendTelegramMessage(
       chatId,
       `❌ Could not apply changes: ${err.message}. Try again or send /cancel.`,
-      messageId
+      messageId,
+      undefined,
+      threadExtras
     );
   }
   return true;
 }
 
 async function handleCallbackQuery(callbackQuery) {
-  const data = callbackQuery.data || "";
-  const chatId = callbackQuery.message?.chat?.id;
-  const messageId = callbackQuery.message?.message_id;
+  const data = String(callbackQuery.data || "");
+  const msg = callbackQuery.message;
+  const chatId = msg?.chat?.id;
+  const messageId = msg?.message_id;
   const callbackQueryId = callbackQuery.id;
+  const callbackThreadId = msg?.message_thread_id;
 
-  if (!chatId || !messageId) {
-    await answerCallbackQuery(callbackQueryId, "Missing chat message.", true);
+  if (!chatId || messageId == null) {
+    await answerCallbackQuery(callbackQueryId, "Missing chat message for this button.", true);
     return;
   }
+
+  const callbackExtras =
+    callbackThreadId != null ? { message_thread_id: callbackThreadId } : {};
 
   const logPrefix = "log:";
   const editPrefix = "edit:";
@@ -804,6 +853,17 @@ async function handleCallbackQuery(callbackQuery) {
     }
     inflightLogTokens.add(token);
 
+    const entryThreadExtras =
+      entry.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : callbackExtras;
+
+    try {
+      await answerCallbackQuery(callbackQueryId, "Saving to your sheet…");
+    } catch (e) {
+      console.error("answerCallbackQuery (log):", e.message);
+    }
+
     try {
       await appendTransactionToSheets(entry.draft, entry.draft.category, entry.messageDate);
       completedLogByToken.set(token, Date.now());
@@ -816,14 +876,15 @@ async function handleCallbackQuery(callbackQuery) {
         `${entry.draft.amount} ${entry.draft.currency} · ${dLabel}`;
 
       try {
-        await answerCallbackQuery(callbackQueryId, "Logged successfully.");
-      } catch (_) {
-        /* callback may already be answered on duplicate delivery */
-      }
-      try {
-        await editTelegramMessage(chatId, messageId, successText, { inline_keyboard: [] });
+        await editTelegramMessage(chatId, messageId, successText, { inline_keyboard: [] }, entryThreadExtras);
       } catch {
-        await sendTelegramMessage(chatId, successText, null);
+        await sendTelegramMessage(
+          chatId,
+          successText,
+          null,
+          undefined,
+          entryThreadExtras
+        );
       }
       awaitingEditByChat.delete(chatId);
     } catch (err) {
@@ -832,19 +893,12 @@ async function handleCallbackQuery(callbackQuery) {
 
       const failDetail = (err.message || "Unknown error").slice(0, 400);
       try {
-        await answerCallbackQuery(
-          callbackQueryId,
-          `Log failed: ${failDetail}`.slice(0, 190),
-          true
-        );
-      } catch (_) {
-        /* ignore */
-      }
-      try {
         await sendTelegramMessage(
           chatId,
           `❌ Log failed — nothing new was saved to the sheet.\n${failDetail}`,
-          null
+          null,
+          undefined,
+          entryThreadExtras
         );
       } catch (notifyError) {
         console.error("Failed to send Telegram error:", notifyError.message);
@@ -869,11 +923,18 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     awaitingEditByChat.set(chatId, { token });
+    const editThreadExtras =
+      entry.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : callbackExtras;
+
     await answerCallbackQuery(callbackQueryId);
     await sendTelegramMessage(
       chatId,
       "✏️ What would you like to change? For example: category to Shopping, amount 120, currency USD, or location Tokyo.",
-      messageId
+      messageId,
+      undefined,
+      editThreadExtras
     );
     return;
   }
@@ -899,6 +960,8 @@ app.post("/webhook/telegram", async (req, res) => {
       message?.from?.username ||
       `${message?.from?.id || "Unknown"}`;
     const messageId = message?.message_id;
+    const messageThreadId = message?.message_thread_id;
+    const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
 
     if (!chatId || !originalMessage) {
       return ok();
@@ -909,7 +972,7 @@ app.post("/webhook/telegram", async (req, res) => {
     if (isStartCommand(originalMessage)) {
       awaitingEditByChat.delete(chatId);
       try {
-        await sendTelegramMessage(chatId, getWelcomeMessage(), messageId);
+        await sendTelegramMessage(chatId, getWelcomeMessage(), messageId, undefined, threadExtras);
       } catch (err) {
         console.error("Telegram send error:", err.message);
       }
@@ -922,7 +985,9 @@ app.post("/webhook/telegram", async (req, res) => {
         await sendTelegramMessage(
           chatId,
           "Edit cancelled. Send an expense when you're ready.",
-          messageId
+          messageId,
+          undefined,
+          threadExtras
         );
       } catch (err) {
         console.error("Telegram send error:", err.message);
@@ -932,19 +997,33 @@ app.post("/webhook/telegram", async (req, res) => {
 
     try {
       if (awaitingEditByChat.has(chatId)) {
-        const handled = await processEditInstruction(chatId, originalMessage.trim(), messageId);
+        const handled = await processEditInstruction(
+          chatId,
+          originalMessage.trim(),
+          messageId,
+          messageThreadId
+        );
         if (handled) {
           return ok();
         }
       }
 
-      await processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate);
+      await processExpenseFlow(
+        chatId,
+        originalMessage,
+        sender,
+        messageId,
+        messageDate,
+        messageThreadId
+      );
     } catch (error) {
       try {
         await sendTelegramMessage(
           chatId,
           `❌ ${error.message || "Something went wrong. Try again."}`,
-          messageId
+          messageId,
+          undefined,
+          threadExtras
         );
       } catch (notifyError) {
         console.error("Failed to send Telegram error:", notifyError.message);
