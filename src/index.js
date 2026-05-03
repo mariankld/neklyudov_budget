@@ -123,12 +123,12 @@ function escapeGoogleSheetRangeTitle(sheetName) {
 
 function createGoogleSheetsClient() {
   const oauth2Client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_OAUTH_REDIRECT_URI || "http://127.0.0.1:3001/oauth/callback"
+    String(process.env.GOOGLE_CLIENT_ID || "").trim(),
+    String(process.env.GOOGLE_CLIENT_SECRET || "").trim(),
+    (process.env.GOOGLE_OAUTH_REDIRECT_URI || "http://127.0.0.1:3001/oauth/callback").trim()
   );
   oauth2Client.setCredentials({
-    refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+    refresh_token: String(process.env.GOOGLE_REFRESH_TOKEN || "").trim(),
   });
   return google.sheets({ version: "v4", auth: oauth2Client });
 }
@@ -205,14 +205,26 @@ function formatDateDdMmYyyy(date) {
 }
 
 async function fetchSpreadsheetTabTitles(sheets, spreadsheetId) {
-  const meta = await sheets.spreadsheets.get({
-    spreadsheetId,
-    fields: "sheets(properties(title))",
-  });
-  const sheetsList = meta.data.sheets || [];
-  return sheetsList
-    .map((s) => s.properties && s.properties.title)
-    .filter(Boolean);
+  try {
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets(properties(title))",
+    });
+    const sheetsList = meta.data.sheets || [];
+    return sheetsList
+      .map((s) => s.properties && s.properties.title)
+      .filter(Boolean);
+  } catch (err) {
+    if (isGoogleSheetsNotFoundError(err)) {
+      const idShort = String(spreadsheetId).slice(0, 8);
+      throw new Error(
+        `Google Sheets: spreadsheet not found or no access (id starting ${idShort}…). ` +
+          `Copy GOOGLE_SPREADSHEET_ID from the URL with no spaces; open the sheet with the same Google account you used for OAuth; share the file with that account if needed. ` +
+          `Original: ${err.message || err}`
+      );
+    }
+    throw err;
+  }
 }
 
 /**
@@ -542,7 +554,7 @@ function buildRawRowValues(draft, categorySheetName) {
 }
 
 async function appendTransactionToSheets(draft, categorySheetName) {
-  const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID;
+  const spreadsheetId = getSpreadsheetIdFromEnv();
   const sheets = createGoogleSheetsClient();
   const rawRow = buildRawRowValues(draft, categorySheetName);
 
@@ -580,6 +592,19 @@ function requireEnv(name) {
   if (!v || !String(v).trim()) {
     throw new Error(`Missing required environment variable: ${name}`);
   }
+}
+
+function getSpreadsheetIdFromEnv() {
+  const v = process.env.GOOGLE_SPREADSHEET_ID;
+  return v ? String(v).trim() : "";
+}
+
+function isGoogleSheetsNotFoundError(err) {
+  const msg = (err && (err.message || err.toString())) || "";
+  const code = err && (err.code || err.response?.status);
+  const reason = err?.response?.data?.error?.errors?.[0]?.reason;
+  if (code === 404 || reason === "notFound") return true;
+  return /not found|NOT_FOUND|Requested entity was not found/i.test(msg);
 }
 
 /**
@@ -650,7 +675,10 @@ async function bootstrap() {
   requireEnv("GOOGLE_REFRESH_TOKEN");
 
   const sheets = createGoogleSheetsClient();
-  const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID;
+  const spreadsheetId = getSpreadsheetIdFromEnv();
+  if (!spreadsheetId) {
+    throw new Error("GOOGLE_SPREADSHEET_ID is empty after trim.");
+  }
 
   const tabTitles = await fetchSpreadsheetTabTitles(sheets, spreadsheetId);
   if (!tabTitles.length) {
