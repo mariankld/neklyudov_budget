@@ -633,22 +633,33 @@ async function ensureTelegramWebhook() {
   }
 
   const webhookUrl = `${base}/webhook/telegram`;
+  /** Must include callback_query or inline-button taps are never POSTed to this URL. */
+  const allowedUpdates = ["message", "callback_query", "edited_message"];
+
   try {
-    const apiBase = getTelegramApiBase();
-    const setRes = await axios.post(
-      `${apiBase}/setWebhook`,
-      { url: webhookUrl },
-      { timeout: 15000 }
-    );
-    if (!setRes.data?.ok) {
-      console.error("Telegram setWebhook failed:", setRes.data);
+    await callTelegramApi("setWebhook", {
+      url: webhookUrl,
+      allowed_updates: allowedUpdates,
+      drop_pending_updates: false,
+    });
+
+    const infoRes = await axios.get(`${getTelegramApiBase()}/getWebhookInfo`, {
+      timeout: 15000,
+    });
+    const info = infoRes.data?.result;
+    if (!infoRes.data?.ok) {
+      console.error("getWebhookInfo failed:", infoRes.data);
       return;
     }
-    const infoRes = await axios.get(`${apiBase}/getWebhookInfo`, { timeout: 15000 });
-    const info = infoRes.data?.result;
     console.log(
-      `Telegram webhook → ${info?.url || webhookUrl} (pending updates: ${info?.pending_update_count ?? 0})`
+      `Telegram webhook → ${info?.url || webhookUrl} (pending: ${info?.pending_update_count ?? 0}) allowed_updates=${JSON.stringify(info?.allowed_updates)}`
     );
+    const au = info?.allowed_updates;
+    if (Array.isArray(au) && au.length > 0 && !au.includes("callback_query")) {
+      console.error(
+        "WARNING: Telegram webhook is not subscribed to callback_query — inline buttons will not reach this server. Redeploy or call setWebhook with allowed_updates including callback_query."
+      );
+    }
   } catch (err) {
     console.error("Telegram setWebhook error:", err.response?.data || err.message);
   }
@@ -981,12 +992,18 @@ app.post("/webhook/telegram", async (req, res) => {
       await safeAnswerCallbackQuery(callbackQuery.id);
       res.status(200).json({ ok: true });
       handleCallbackQuery(callbackQuery).catch((err) =>
-        console.error("handleCallbackQuery:", err.message)
+        console.error("handleCallbackQuery:", err.stack || err.message)
       );
       return;
     }
 
     const message = req.body?.message;
+    if (!message && req.body && Object.keys(req.body).length) {
+      console.log(
+        "Telegram webhook (no message/callback):",
+        Object.keys(req.body).join(", ")
+      );
+    }
     const chatId = message?.chat?.id;
     const originalMessage = message?.text;
     const sender =
