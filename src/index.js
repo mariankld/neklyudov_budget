@@ -26,6 +26,12 @@ const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
 /** token -> { draft, originalMessage, sender, sourceMessageId, chatId, createdAt } */
 const pendingByToken = new Map();
 
+/** Successfully logged tokens (idempotency); same TTL as pending. token -> completedAt ms */
+const completedLogByToken = new Map();
+
+/** Tokens currently being written (guards parallel webhook deliveries / double-tap races). */
+const inflightLogTokens = new Set();
+
 /** chatId -> { token } — user clicked Edit and should reply with changes */
 const awaitingEditByChat = new Map();
 
@@ -157,9 +163,33 @@ async function logFirstRow(sheets, spreadsheetId, sheetLabel, sheetName) {
   }
 }
 
-async function appendRowToGoogleSheet(sheets, spreadsheetId, sheetName, rowValues) {
+function cellsRoughlyEqual(expected, actual) {
+  if (expected === actual) return true;
+  const ex = expected === null || expected === undefined ? "" : String(expected).trim();
+  const ac = actual === null || actual === undefined ? "" : String(actual).trim();
+  if (ex === ac) return true;
+  const nEx = Number(ex.replace(",", "."));
+  const nAc = Number(String(ac).replace(",", "."));
+  if (Number.isFinite(nEx) && Number.isFinite(nAc) && Math.abs(nEx - nAc) < 1e-9) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Triple-check: (1) append API says exactly one row written, (2) read-back row exists,
+ * (3) critical fields match (amount + category), tolerating Sheets date/number display formatting.
+ */
+async function appendRowAndVerify(
+  sheets,
+  spreadsheetId,
+  sheetName,
+  rowValues,
+  label,
+  criticalChecks
+) {
   const range = `${escapeGoogleSheetRangeTitle(sheetName)}!A:Z`;
-  await sheets.spreadsheets.values.append({
+  const appendRes = await sheets.spreadsheets.values.append({
     spreadsheetId,
     range,
     valueInputOption: "USER_ENTERED",
@@ -168,6 +198,37 @@ async function appendRowToGoogleSheet(sheets, spreadsheetId, sheetName, rowValue
       values: [rowValues],
     },
   });
+
+  const updates = appendRes.data?.updates;
+  const updatedRows = updates?.updatedRows;
+  const updatedRange = updates?.updatedRange;
+  if (updatedRows !== 1 || !updatedRange) {
+    throw new Error(
+      `${label}: Sheets append did not report a single new row (updatedRows=${updatedRows}).`
+    );
+  }
+
+  const readRes = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: updatedRange,
+    valueRenderOption: "UNFORMATTED_VALUE",
+    dateTimeRenderOption: "SERIAL_NUMBER",
+  });
+  const gotRow = readRes.data?.values?.[0];
+  if (!gotRow || !gotRow.length) {
+    throw new Error(`${label}: Read-back after append returned empty.`);
+  }
+
+  for (const { index, name, expected } of criticalChecks) {
+    const act = index < gotRow.length ? gotRow[index] : "";
+    if (!cellsRoughlyEqual(expected, act)) {
+      throw new Error(
+        `${label}: Verification failed for ${name} (expected "${expected}", got "${act}").`
+      );
+    }
+  }
+
+  return appendRes;
 }
 
 const transactionJsonSchema = {
@@ -353,6 +414,11 @@ function prunePending() {
       pendingByToken.delete(token);
     }
   }
+  for (const [token, completedAt] of completedLogByToken.entries()) {
+    if (now - completedAt > PENDING_TTL_MS) {
+      completedLogByToken.delete(token);
+    }
+  }
 }
 
 function newPendingToken() {
@@ -427,8 +493,22 @@ async function appendTransactionToSheets(draft, categorySheetName, messageDate) 
   const rawRow = buildRawRowValues(draft, categorySheetName);
   const categoryRow = buildCategoryRowValues(draft, categorySheetName, messageDate);
 
-  await appendRowToGoogleSheet(sheets, spreadsheetId, RAW_SHEET, rawRow);
-  await appendRowToGoogleSheet(sheets, spreadsheetId, categorySheetName, categoryRow);
+  await appendRowAndVerify(sheets, spreadsheetId, RAW_SHEET, rawRow, `RAW "${RAW_SHEET}"`, [
+    { index: 1, name: "type", expected: draft.type === "income" ? "Income" : "Expense" },
+    { index: 2, name: "category tab", expected: categorySheetName },
+    { index: 6, name: "amount", expected: draft.amount },
+  ]);
+  await appendRowAndVerify(
+    sheets,
+    spreadsheetId,
+    categorySheetName,
+    categoryRow,
+    `Category "${categorySheetName}"`,
+    [
+      { index: 2, name: "amount", expected: draft.amount },
+      { index: 4, name: "category tab", expected: categorySheetName },
+    ]
+  );
 }
 
 function isStartCommand(text) {
@@ -686,8 +766,26 @@ async function handleCallbackQuery(callbackQuery) {
   if (data.startsWith(logPrefix)) {
     const token = data.slice(logPrefix.length);
     prunePending();
+
+    if (completedLogByToken.has(token)) {
+      await answerCallbackQuery(
+        callbackQueryId,
+        "Already logged — this entry was saved. Check RAW and the category tab.",
+        true
+      );
+      return;
+    }
+
     const entry = pendingByToken.get(token);
     if (!entry) {
+      if (inflightLogTokens.has(token)) {
+        await answerCallbackQuery(
+          callbackQueryId,
+          "Already saving this expense — please wait for the result.",
+          true
+        );
+        return;
+      }
       await answerCallbackQuery(callbackQueryId, "This confirmation expired. Send the expense again.", true);
       return;
     }
@@ -696,35 +794,63 @@ async function handleCallbackQuery(callbackQuery) {
       return;
     }
 
+    if (!pendingByToken.delete(token)) {
+      await answerCallbackQuery(
+        callbackQueryId,
+        "Already saving this expense — please wait for the result.",
+        true
+      );
+      return;
+    }
+    inflightLogTokens.add(token);
+
     try {
-      await answerCallbackQuery(callbackQueryId);
       await appendTransactionToSheets(entry.draft, entry.draft.category, entry.messageDate);
+      completedLogByToken.set(token, Date.now());
+
       const cat = entry.draft.category;
       const dLabel = entry.draft.dateDdMmYyyy;
-      const successText = `✅ Logged: ${entry.draft.amount} ${entry.draft.type} under ${cat} (${dLabel}).`;
+      const successText =
+        `✅ Logged successfully.\n` +
+        `Verified in Google Sheets: "${RAW_SHEET}" and "${cat}".\n` +
+        `${entry.draft.amount} ${entry.draft.currency} · ${dLabel}`;
+
+      try {
+        await answerCallbackQuery(callbackQueryId, "Logged successfully.");
+      } catch (_) {
+        /* callback may already be answered on duplicate delivery */
+      }
       try {
         await editTelegramMessage(chatId, messageId, successText, { inline_keyboard: [] });
       } catch {
         await sendTelegramMessage(chatId, successText, null);
       }
-      pendingByToken.delete(token);
       awaitingEditByChat.delete(chatId);
     } catch (err) {
       console.error("Log callback error:", err.message);
+      pendingByToken.set(token, entry);
+
+      const failDetail = (err.message || "Unknown error").slice(0, 400);
       try {
-        await answerCallbackQuery(callbackQueryId, "Could not save. Try again.", true);
+        await answerCallbackQuery(
+          callbackQueryId,
+          `Log failed: ${failDetail}`.slice(0, 190),
+          true
+        );
       } catch (_) {
         /* ignore */
       }
       try {
         await sendTelegramMessage(
           chatId,
-          "❌ Error saving to the spreadsheet. Please check access and try again.",
+          `❌ Log failed — nothing new was saved to the sheet.\n${failDetail}`,
           null
         );
       } catch (notifyError) {
         console.error("Failed to send Telegram error:", notifyError.message);
       }
+    } finally {
+      inflightLogTokens.delete(token);
     }
     return;
   }
@@ -756,78 +882,81 @@ async function handleCallbackQuery(callbackQuery) {
 }
 
 app.post("/webhook/telegram", async (req, res) => {
-  res.status(200).json({ ok: true });
-
-  const callbackQuery = req.body?.callback_query;
-  if (callbackQuery) {
-    try {
-      await handleCallbackQuery(callbackQuery);
-    } catch (err) {
-      console.error("Callback error:", err.message);
-    }
-    return;
-  }
-
-  const message = req.body?.message;
-  const chatId = message?.chat?.id;
-  const originalMessage = message?.text;
-  const sender =
-    message?.from?.first_name ||
-    message?.from?.username ||
-    `${message?.from?.id || "Unknown"}`;
-  const messageId = message?.message_id;
-
-  if (!chatId || !originalMessage) {
-    return;
-  }
-
-  const messageDate = new Date((message.date || Math.floor(Date.now() / 1000)) * 1000);
-
-  if (isStartCommand(originalMessage)) {
-    awaitingEditByChat.delete(chatId);
-    try {
-      await sendTelegramMessage(chatId, getWelcomeMessage(), messageId);
-    } catch (err) {
-      console.error("Telegram send error:", err.message);
-    }
-    return;
-  }
-
-  if (isCancelCommand(originalMessage)) {
-    awaitingEditByChat.delete(chatId);
-    try {
-      await sendTelegramMessage(
-        chatId,
-        "Edit cancelled. Send an expense when you're ready.",
-        messageId
-      );
-    } catch (err) {
-      console.error("Telegram send error:", err.message);
-    }
-    return;
-  }
+  const ok = () => res.status(200).json({ ok: true });
 
   try {
-    if (awaitingEditByChat.has(chatId)) {
-      const handled = await processEditInstruction(chatId, originalMessage.trim(), messageId);
-      if (handled) {
-        return;
+    const callbackQuery = req.body?.callback_query;
+    if (callbackQuery) {
+      await handleCallbackQuery(callbackQuery);
+      return ok();
+    }
+
+    const message = req.body?.message;
+    const chatId = message?.chat?.id;
+    const originalMessage = message?.text;
+    const sender =
+      message?.from?.first_name ||
+      message?.from?.username ||
+      `${message?.from?.id || "Unknown"}`;
+    const messageId = message?.message_id;
+
+    if (!chatId || !originalMessage) {
+      return ok();
+    }
+
+    const messageDate = new Date((message.date || Math.floor(Date.now() / 1000)) * 1000);
+
+    if (isStartCommand(originalMessage)) {
+      awaitingEditByChat.delete(chatId);
+      try {
+        await sendTelegramMessage(chatId, getWelcomeMessage(), messageId);
+      } catch (err) {
+        console.error("Telegram send error:", err.message);
       }
+      return ok();
     }
 
-    await processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate);
-  } catch (error) {
+    if (isCancelCommand(originalMessage)) {
+      awaitingEditByChat.delete(chatId);
+      try {
+        await sendTelegramMessage(
+          chatId,
+          "Edit cancelled. Send an expense when you're ready.",
+          messageId
+        );
+      } catch (err) {
+        console.error("Telegram send error:", err.message);
+      }
+      return ok();
+    }
+
     try {
-      await sendTelegramMessage(
-        chatId,
-        `❌ ${error.message || "Something went wrong. Try again."}`,
-        messageId
-      );
-    } catch (notifyError) {
-      console.error("Failed to send Telegram error:", notifyError.message);
+      if (awaitingEditByChat.has(chatId)) {
+        const handled = await processEditInstruction(chatId, originalMessage.trim(), messageId);
+        if (handled) {
+          return ok();
+        }
+      }
+
+      await processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate);
+    } catch (error) {
+      try {
+        await sendTelegramMessage(
+          chatId,
+          `❌ ${error.message || "Something went wrong. Try again."}`,
+          messageId
+        );
+      } catch (notifyError) {
+        console.error("Failed to send Telegram error:", notifyError.message);
+      }
+
+      console.error("Workflow error:", error.message);
     }
 
-    console.error("Workflow error:", error.message);
+    return ok();
+  } catch (err) {
+    console.error("Webhook handler error:", err.message);
+    return ok();
   }
 });
 
