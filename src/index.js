@@ -10,8 +10,9 @@ app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 
+/** Logical income category label stored in RAW (column 3); not required to be a sheet tab when using GOOGLE_CATEGORY_LIST. */
 const INCOME_SHEET = (process.env.INCOME_SHEET_NAME || "Income").trim();
-const RAW_SHEET = (process.env.RAW_SHEET_NAME || "Expenses_RAW").trim();
+const RAW_SHEET = (process.env.RAW_SHEET_NAME || "RAW").trim();
 /** Dashboard tab: never used as a category target or written by the logger. */
 const SUMMARY_TAB = (process.env.GOOGLE_SUMMARY_TAB || "Summary").trim();
 const DEFAULT_CURRENCY = (process.env.DEFAULT_EXPENSE_CURRENCY || "HKD").trim();
@@ -116,12 +117,6 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-function getIsoParts(date) {
-  const isoDate = date.toISOString().slice(0, 10);
-  const time = date.toTimeString().slice(0, 8);
-  return { isoDate, time };
-}
-
 function escapeGoogleSheetRangeTitle(sheetName) {
   return `'${sheetName.replace(/'/g, "''")}'`;
 }
@@ -144,6 +139,20 @@ function parseSkipTabNames() {
     .map((s) => s.trim())
     .filter(Boolean);
   return new Set(extra);
+}
+
+/**
+ * Optional explicit category names for OpenAI (Summary + RAW layout with no per-category tabs).
+ * Comma-, pipe-, or newline-separated. When set, tabs are not scanned for categories.
+ */
+function parseCategoryListFromEnv() {
+  const raw = (process.env.GOOGLE_CATEGORY_LIST || "").trim();
+  if (!raw) return null;
+  const list = raw
+    .split(/[|,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length ? list : null;
 }
 
 function parseCategoryMappingEnv() {
@@ -207,9 +216,8 @@ async function fetchSpreadsheetTabTitles(sheets, spreadsheetId) {
 }
 
 /**
- * Tabs the model may choose as the expense/income *category* (real sheet to log under).
- * RAW is omitted on purpose: it is not a category—every transaction is always appended to
- * RAW_SHEET separately as the full audit trail (see webhook). Summary is the dashboard.
+ * Tabs the model may choose as expense/income *category labels* (stored in RAW only when using GOOGLE_CATEGORY_LIST).
+ * Legacy mode: one tab per category plus RAW + Summary. RAW / Summary are excluded from this list.
  */
 function buildAllowedCategoriesFromTabs(allTitles) {
   const skip = parseSkipTabNames();
@@ -323,8 +331,8 @@ function buildAnalysisPrompt(messageText, contextDateLabel) {
   const categoryList = allowedCategories.join(", ");
   return [
     `The user's message date context: ${contextDateLabel}.`,
-    `Available category tabs (pick exactly one sheet name or a close synonym; synonyms map via env): ${categoryList}.`,
-    `Never use "${RAW_SHEET}" as category—that tab receives every row automatically.`,
+    `Available categories (pick exactly one name or a close synonym; synonyms map via env): ${categoryList}.`,
+    `Never use "${RAW_SHEET}" as category—all rows are logged only there.`,
     `For salary, incoming transfers, or money received, use type "income" and category "${INCOME_SHEET}".`,
     "",
     "Fill fields as follows:",
@@ -343,7 +351,7 @@ function buildEditPrompt(currentDraft, editInstruction, originalMessage) {
   const categoryList = allowedCategories.join(", ");
   return [
     "Apply the user's edit instructions to this draft. Keep other fields unchanged unless the edit implies them.",
-    `Allowed categories: ${categoryList}. Never use "${RAW_SHEET}" as category.`,
+    `Allowed categories: ${categoryList}. Never use "${RAW_SHEET}" as category name.`,
     "",
     "Current draft (JSON):",
     JSON.stringify(currentDraft),
@@ -396,7 +404,7 @@ async function parseTransactionWithOpenAI(messageText, messageDate) {
     input: [
       {
         role: "system",
-        content: `You analyze Telegram budget messages for a family spreadsheet. Output strict JSON only. Map spending to the closest category tab. Today for context is ${contextDateLabel}.`,
+        content: `You analyze Telegram budget messages for a family spreadsheet. Output strict JSON only. Map spending to the closest allowed category name. Today for context is ${contextDateLabel}.`,
       },
       {
         role: "user",
@@ -503,7 +511,7 @@ function formatDraftPreview(draft, categorySheetName) {
     "",
     `Date: ${draft.dateDdMmYyyy}`,
     `Type: ${typeLabel}`,
-    `Category: ${categorySheetName} (sheet tab)`,
+    `Category: ${categorySheetName}`,
     `Subcategory: ${draft.subcategory || "—"}`,
     `Description: ${draft.description}`,
     `Location: ${draft.location}`,
@@ -514,13 +522,6 @@ function formatDraftPreview(draft, categorySheetName) {
     "",
     "Does this look good?",
   ].join("\n");
-}
-
-function categoryTabRowDescription(draft) {
-  if (draft.subcategory) {
-    return `${draft.subcategory}: ${draft.description}`;
-  }
-  return draft.description;
 }
 
 function buildRawRowValues(draft, categorySheetName) {
@@ -540,41 +541,16 @@ function buildRawRowValues(draft, categorySheetName) {
   ];
 }
 
-function buildCategoryRowValues(draft, categorySheetName, messageDate) {
-  const md = messageDate instanceof Date ? messageDate : new Date();
-  const { isoDate, time } = getIsoParts(md);
-  return [
-    isoDate,
-    time,
-    draft.amount,
-    draft.type,
-    categorySheetName,
-    categoryTabRowDescription(draft),
-  ];
-}
-
-async function appendTransactionToSheets(draft, categorySheetName, messageDate) {
+async function appendTransactionToSheets(draft, categorySheetName) {
   const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID;
   const sheets = createGoogleSheetsClient();
   const rawRow = buildRawRowValues(draft, categorySheetName);
-  const categoryRow = buildCategoryRowValues(draft, categorySheetName, messageDate);
 
   await appendRowAndVerify(sheets, spreadsheetId, RAW_SHEET, rawRow, `RAW "${RAW_SHEET}"`, [
     { index: 1, name: "type", expected: draft.type === "income" ? "Income" : "Expense" },
-    { index: 2, name: "category tab", expected: categorySheetName },
+    { index: 2, name: "category", expected: categorySheetName },
     { index: 6, name: "amount", expected: draft.amount },
   ]);
-  await appendRowAndVerify(
-    sheets,
-    spreadsheetId,
-    categorySheetName,
-    categoryRow,
-    `Category "${categorySheetName}"`,
-    [
-      { index: 2, name: "amount", expected: draft.amount },
-      { index: 4, name: "category tab", expected: categorySheetName },
-    ]
-  );
 }
 
 function isStartCommand(text) {
@@ -593,7 +569,7 @@ function getWelcomeMessage() {
     '• "1200 dinner at restaurant"',
     '• "Купил продукты на 800"',
     "",
-    "I'll analyze the amount and description, show a preview (category tab, RAW fields), and wait for you to tap Yes, log it or Edit before anything is saved. ✅",
+    "I'll analyze the amount and description, show a preview (category + RAW columns), and wait for you to tap Yes, log it or Edit before anything is saved. ✅",
     "",
     "If you're editing and change your mind, send /cancel.",
   ].join("\n");
@@ -687,40 +663,44 @@ async function bootstrap() {
     );
   }
 
-  if (!tabTitles.includes(INCOME_SHEET)) {
-    throw new Error(
-      `Income tab "${INCOME_SHEET}" not found. Available tabs: ${tabTitles.join(", ")}. Set INCOME_SHEET_NAME in .env.`
-    );
-  }
-
   categoryAliasMap = parseCategoryMappingEnv();
-  allowedCategories = buildAllowedCategoriesFromTabs(tabTitles);
+
+  const fromEnv = parseCategoryListFromEnv();
+  if (fromEnv) {
+    allowedCategories = fromEnv;
+  } else {
+    allowedCategories = buildAllowedCategoriesFromTabs(tabTitles);
+    if (!tabTitles.includes(INCOME_SHEET)) {
+      throw new Error(
+        `Income tab "${INCOME_SHEET}" not found. Available tabs: ${tabTitles.join(", ")}. Set INCOME_SHEET_NAME in .env or set GOOGLE_CATEGORY_LIST.`
+      );
+    }
+  }
 
   if (!allowedCategories.length) {
     throw new Error(
-      "No category tabs after exclusions. Check GOOGLE_SKIP_TABS and RAW_SHEET_NAME."
+      'No categories configured. Set GOOGLE_CATEGORY_LIST (for Summary+RAW-only spreadsheets) or add category tabs and GOOGLE_SKIP_TABS as needed.'
     );
   }
 
   if (!allowedCategories.includes(INCOME_SHEET)) {
     throw new Error(
-      `Income tab "${INCOME_SHEET}" was excluded. Remove it from GOOGLE_SKIP_TABS if listed there.`
+      fromEnv
+        ? `GOOGLE_CATEGORY_LIST must include the income label "${INCOME_SHEET}" (see INCOME_SHEET_NAME).`
+        : `Income tab "${INCOME_SHEET}" was excluded. Remove it from GOOGLE_SKIP_TABS if listed there.`
     );
   }
 
   console.log(
-    `Budget logger: ${allowedCategories.length} category targets (sheet tabs the model may choose) — ${allowedCategories.join(", ")}`
+    `Budget logger: ${allowedCategories.length} categories — ${allowedCategories.join(", ")}` +
+      (fromEnv ? " (from GOOGLE_CATEGORY_LIST)" : " (from sheet tabs)")
   );
-  console.log(
-    `Universal RAW log (every transaction is appended here; not a category option): "${RAW_SHEET}"`
-  );
+  console.log(`Every transaction is appended once to "${RAW_SHEET}" only.`);
   if (categoryAliasMap.size) {
     console.log(`Category aliases loaded: ${categoryAliasMap.size}`);
   }
 
   await logFirstRow(sheets, spreadsheetId, "RAW log", RAW_SHEET);
-  const sampleCategoryTab = allowedCategories.find((t) => t !== INCOME_SHEET) || INCOME_SHEET;
-  await logFirstRow(sheets, spreadsheetId, "Sample category", sampleCategoryTab);
 }
 
 function isCancelCommand(text) {
@@ -867,7 +847,7 @@ async function handleCallbackQuery(callbackQuery) {
     prunePending();
 
     if (completedLogByToken.has(token)) {
-      await tell("ℹ️ This line was already logged. Check your RAW and category tabs.");
+      await tell(`ℹ️ This line was already logged. Check "${RAW_SHEET}".`);
       return;
     }
 
@@ -899,14 +879,14 @@ async function handleCallbackQuery(callbackQuery) {
         : callbackExtras;
 
     try {
-      await appendTransactionToSheets(entry.draft, entry.draft.category, entry.messageDate);
+      await appendTransactionToSheets(entry.draft, entry.draft.category);
       completedLogByToken.set(token, Date.now());
 
       const cat = entry.draft.category;
       const dLabel = entry.draft.dateDdMmYyyy;
       const successText =
         `✅ Logged successfully.\n` +
-        `Verified in Google Sheets: "${RAW_SHEET}" and "${cat}".\n` +
+        `Verified in Google Sheets tab "${RAW_SHEET}" (${cat}).\n` +
         `${entry.draft.amount} ${entry.draft.currency} · ${dLabel}`;
 
       try {
