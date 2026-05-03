@@ -38,12 +38,23 @@ const awaitingEditByChat = new Map();
 /** Lowercase alias → exact tab title; from CATEGORY_MAPPING JSON in .env */
 let categoryAliasMap = new Map();
 
-const TELEGRAM_API_BASE = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
+function getTelegramApiBase() {
+  const t = process.env.TELEGRAM_BOT_TOKEN;
+  if (!t || !String(t).trim()) {
+    throw new Error("TELEGRAM_BOT_TOKEN is not set");
+  }
+  return `https://api.telegram.org/bot${String(t).trim()}`;
+}
 
-/** Telegram Bot API returns HTTP 200 with { ok: false } for most errors; axios does not throw. */
+const telegramHttpTimeoutMs = () =>
+  Number(process.env.TELEGRAM_HTTP_TIMEOUT_MS || 25000);
+
+/** Telegram Bot API returns HTTP 200 with { ok: false } for many errors; axios does not throw. */
 async function callTelegramApi(method, body) {
   try {
-    const res = await axios.post(`${TELEGRAM_API_BASE}/${method}`, body);
+    const res = await axios.post(`${getTelegramApiBase()}/${method}`, body, {
+      timeout: telegramHttpTimeoutMs(),
+    });
     const data = res.data;
     if (!data?.ok) {
       throw new Error(data?.description || `Telegram ${method}: ${JSON.stringify(data)}`);
@@ -55,6 +66,26 @@ async function callTelegramApi(method, body) {
       throw new Error(`Telegram ${method}: ${desc}`);
     }
     throw err;
+  }
+}
+
+/**
+ * Clears the client's loading state on inline buttons. Must not throw — runs before heavy work.
+ * Uses a short timeout so the webhook can finish quickly even if Telegram is slow.
+ */
+async function safeAnswerCallbackQuery(callbackQueryId) {
+  if (!callbackQueryId) return;
+  try {
+    const res = await axios.post(
+      `${getTelegramApiBase()}/answerCallbackQuery`,
+      { callback_query_id: callbackQueryId },
+      { timeout: Math.min(15000, telegramHttpTimeoutMs()) }
+    );
+    if (!res.data?.ok) {
+      console.error("answerCallbackQuery:", res.data?.description || res.data);
+    }
+  } catch (err) {
+    console.error("answerCallbackQuery failed:", err.response?.data || err.message);
   }
 }
 
@@ -340,14 +371,6 @@ async function sendTelegramMessage(chatId, text, replyToMessageId, replyMarkup, 
   await callTelegramApi("sendMessage", body);
 }
 
-async function answerCallbackQuery(callbackQueryId, text, showAlert) {
-  await callTelegramApi("answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    text: text || undefined,
-    show_alert: Boolean(showAlert),
-  });
-}
-
 async function editTelegramMessage(chatId, messageId, text, replyMarkup, extras = {}) {
   const body = {
     chat_id: chatId,
@@ -611,12 +634,17 @@ async function ensureTelegramWebhook() {
 
   const webhookUrl = `${base}/webhook/telegram`;
   try {
-    const setRes = await axios.post(`${TELEGRAM_API_BASE}/setWebhook`, { url: webhookUrl });
+    const apiBase = getTelegramApiBase();
+    const setRes = await axios.post(
+      `${apiBase}/setWebhook`,
+      { url: webhookUrl },
+      { timeout: 15000 }
+    );
     if (!setRes.data?.ok) {
       console.error("Telegram setWebhook failed:", setRes.data);
       return;
     }
-    const infoRes = await axios.get(`${TELEGRAM_API_BASE}/getWebhookInfo`);
+    const infoRes = await axios.get(`${apiBase}/getWebhookInfo`, { timeout: 15000 });
     const info = infoRes.data?.result;
     console.log(
       `Telegram webhook → ${info?.url || webhookUrl} (pending updates: ${info?.pending_update_count ?? 0})`
@@ -798,16 +826,27 @@ async function handleCallbackQuery(callbackQuery) {
   const msg = callbackQuery.message;
   const chatId = msg?.chat?.id;
   const messageId = msg?.message_id;
-  const callbackQueryId = callbackQuery.id;
   const callbackThreadId = msg?.message_thread_id;
-
-  if (!chatId || messageId == null) {
-    await answerCallbackQuery(callbackQueryId, "Missing chat message for this button.", true);
-    return;
-  }
 
   const callbackExtras =
     callbackThreadId != null ? { message_thread_id: callbackThreadId } : {};
+
+  async function tell(text) {
+    if (!chatId) return;
+    try {
+      await sendTelegramMessage(chatId, text, null, undefined, callbackExtras);
+    } catch (e) {
+      console.error("callback notice send:", e.message);
+    }
+  }
+
+  if (!chatId || messageId == null) {
+    console.error(
+      "callback_query missing message (cannot notify user); data=%s",
+      data.slice(0, 60)
+    );
+    return;
+  }
 
   const logPrefix = "log:";
   const editPrefix = "edit:";
@@ -817,38 +856,28 @@ async function handleCallbackQuery(callbackQuery) {
     prunePending();
 
     if (completedLogByToken.has(token)) {
-      await answerCallbackQuery(
-        callbackQueryId,
-        "Already logged — this entry was saved. Check RAW and the category tab.",
-        true
-      );
+      await tell("ℹ️ This line was already logged. Check your RAW and category tabs.");
       return;
     }
 
     const entry = pendingByToken.get(token);
     if (!entry) {
       if (inflightLogTokens.has(token)) {
-        await answerCallbackQuery(
-          callbackQueryId,
-          "Already saving this expense — please wait for the result.",
-          true
-        );
+        await tell("⏳ Still saving that expense — watch for an update in this chat.");
         return;
       }
-      await answerCallbackQuery(callbackQueryId, "This confirmation expired. Send the expense again.", true);
+      await tell(
+        "⚠️ This confirmation is not on this server anymore — usually a restart or a second app instance. Send the expense again. On Railway/hosting, use exactly one replica unless you add shared storage."
+      );
       return;
     }
     if (entry.chatId !== chatId) {
-      await answerCallbackQuery(callbackQueryId, "Not allowed.", true);
+      await tell("Not allowed.");
       return;
     }
 
     if (!pendingByToken.delete(token)) {
-      await answerCallbackQuery(
-        callbackQueryId,
-        "Already saving this expense — please wait for the result.",
-        true
-      );
+      await tell("⏳ Already saving this expense — watch for the next message.");
       return;
     }
     inflightLogTokens.add(token);
@@ -857,12 +886,6 @@ async function handleCallbackQuery(callbackQuery) {
       entry.messageThreadId != null
         ? { message_thread_id: entry.messageThreadId }
         : callbackExtras;
-
-    try {
-      await answerCallbackQuery(callbackQueryId, "Saving to your sheet…");
-    } catch (e) {
-      console.error("answerCallbackQuery (log):", e.message);
-    }
 
     try {
       await appendTransactionToSheets(entry.draft, entry.draft.category, entry.messageDate);
@@ -914,11 +937,13 @@ async function handleCallbackQuery(callbackQuery) {
     prunePending();
     const entry = pendingByToken.get(token);
     if (!entry) {
-      await answerCallbackQuery(callbackQueryId, "This confirmation expired. Send the expense again.", true);
+      await tell(
+        "⚠️ This confirmation is not on this server anymore. Send the expense again. With multiple replicas, use only one instance."
+      );
       return;
     }
     if (entry.chatId !== chatId) {
-      await answerCallbackQuery(callbackQueryId, "Not allowed.", true);
+      await tell("Not allowed.");
       return;
     }
 
@@ -928,7 +953,6 @@ async function handleCallbackQuery(callbackQuery) {
         ? { message_thread_id: entry.messageThreadId }
         : callbackExtras;
 
-    await answerCallbackQuery(callbackQueryId);
     await sendTelegramMessage(
       chatId,
       "✏️ What would you like to change? For example: category to Shopping, amount 120, currency USD, or location Tokyo.",
@@ -939,7 +963,7 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
-  await answerCallbackQuery(callbackQueryId);
+  await tell("Unknown button.");
 }
 
 app.post("/webhook/telegram", async (req, res) => {
@@ -948,8 +972,18 @@ app.post("/webhook/telegram", async (req, res) => {
   try {
     const callbackQuery = req.body?.callback_query;
     if (callbackQuery) {
-      await handleCallbackQuery(callbackQuery);
-      return ok();
+      console.log(
+        "Telegram callback:",
+        String(callbackQuery.data || "").slice(0, 48),
+        "chat",
+        callbackQuery.message?.chat?.id
+      );
+      await safeAnswerCallbackQuery(callbackQuery.id);
+      res.status(200).json({ ok: true });
+      handleCallbackQuery(callbackQuery).catch((err) =>
+        console.error("handleCallbackQuery:", err.message)
+      );
+      return;
     }
 
     const message = req.body?.message;
