@@ -265,7 +265,7 @@ function formatContextDateLabel(messageDate) {
 async function parseTransactionWithOpenAI(messageText, messageDate) {
   const contextDateLabel = formatContextDateLabel(messageDate);
   const completion = await openai.responses.create({
-    model: process.env.OPENAI_MODEL || "gpt-5.5-medium",
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
     input: [
       {
         role: "system",
@@ -291,7 +291,7 @@ async function parseTransactionWithOpenAI(messageText, messageDate) {
 
 async function parseEditWithOpenAI(currentDraft, editInstruction, originalMessage) {
   const completion = await openai.responses.create({
-    model: process.env.OPENAI_MODEL || "gpt-5.5-medium",
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
     input: [
       {
         role: "system",
