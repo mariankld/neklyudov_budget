@@ -247,7 +247,52 @@ function requireEnv(name) {
   }
 }
 
+/**
+ * Telegram only POSTs updates if setWebhook points at this server. Long polling is not used.
+ * On Railway, RAILWAY_PUBLIC_DOMAIN is set automatically; override with TELEGRAM_WEBHOOK_BASE_URL.
+ */
+async function ensureTelegramWebhook() {
+  if (!process.env.TELEGRAM_BOT_TOKEN || !String(process.env.TELEGRAM_BOT_TOKEN).trim()) {
+    console.warn("TELEGRAM_BOT_TOKEN is missing.");
+    return;
+  }
+
+  const explicit = (process.env.TELEGRAM_WEBHOOK_BASE_URL || "").trim().replace(/\/$/, "");
+  const staticUrl = (process.env.RAILWAY_STATIC_URL || "").trim().replace(/\/$/, "");
+  const railwayHost = (process.env.RAILWAY_PUBLIC_DOMAIN || "").trim();
+  const railwayFromHost = railwayHost
+    ? `https://${railwayHost.replace(/^https?:\/\//, "")}`
+    : "";
+  const publicUrl = (process.env.PUBLIC_URL || "").trim().replace(/\/$/, "");
+
+  const base = explicit || staticUrl || railwayFromHost || publicUrl;
+  if (!base) {
+    console.warn(
+      "Telegram webhook not set automatically (no TELEGRAM_WEBHOOK_BASE_URL, RAILWAY_PUBLIC_DOMAIN, RAILWAY_STATIC_URL, or PUBLIC_URL). Register manually: POST https://api.telegram.org/bot<token>/setWebhook with url=https://<host>/webhook/telegram"
+    );
+    return;
+  }
+
+  const webhookUrl = `${base}/webhook/telegram`;
+  try {
+    const setRes = await axios.post(`${TELEGRAM_API_BASE}/setWebhook`, { url: webhookUrl });
+    if (!setRes.data?.ok) {
+      console.error("Telegram setWebhook failed:", setRes.data);
+      return;
+    }
+    const infoRes = await axios.get(`${TELEGRAM_API_BASE}/getWebhookInfo`);
+    const info = infoRes.data?.result;
+    console.log(
+      `Telegram webhook → ${info?.url || webhookUrl} (pending updates: ${info?.pending_update_count ?? 0})`
+    );
+  } catch (err) {
+    console.error("Telegram setWebhook error:", err.response?.data || err.message);
+  }
+}
+
 async function bootstrap() {
+  requireEnv("TELEGRAM_BOT_TOKEN");
+  requireEnv("OPENAI_API_KEY");
   requireEnv("GOOGLE_SPREADSHEET_ID");
   requireEnv("GOOGLE_CLIENT_ID");
   requireEnv("GOOGLE_CLIENT_SECRET");
@@ -382,8 +427,9 @@ app.get("/health", (_req, res) => {
 
 bootstrap()
   .then(() => {
-    app.listen(PORT, () => {
+    app.listen(PORT, async () => {
       console.log(`Budget logger is running on port ${PORT}`);
+      await ensureTelegramWebhook();
     });
   })
   .catch((err) => {
