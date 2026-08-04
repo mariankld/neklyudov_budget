@@ -76,8 +76,8 @@ Send a photo instead of text (with or without a caption) and the bot reads it th
 - Compressed Telegram photos and uncompressed image documents (image/* mime type) are both accepted.
 - The highest-resolution version Telegram provides is downloaded and sent to OpenAI as an image input — no separate OCR step.
 - Works for printed/handwritten receipts and screenshots such as iPhone Wallet payment confirmations.
-- If the amount can't be confidently read, the bot replies with an error instead of guessing — send a clearer photo or fall back to a text message.
-- Optional `OPENAI_VISION_MODEL` env var to use a different model for images than `OPENAI_MODEL`; defaults to the same model.
+- The bot never guesses the amount. It reads as carefully as it can, and only if there is truly no readable number does it reply asking you to enter the amount and description manually — it will not default to 0 or invent a figure.
+- Optional `OPENAI_VISION_MODEL` env var to use a different model for images; defaults to `gpt-4o` (better than `gpt-4o-mini` at reading small/blurry text).
 - The same Yes/Edit confirmation flow applies before anything is written to the sheet.
 
 ## Row shape appended by the app

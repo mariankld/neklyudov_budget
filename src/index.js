@@ -519,7 +519,8 @@ function buildImageAnalysisPrompt(captionText, contextDateLabel) {
     `For salary, incoming transfers, or money received, use type "income" and category "${INCOME_SHEET}".`,
     "",
     "Fill fields as follows:",
-    "- amount: the primary total amount charged or paid, as shown in the image. If you cannot confidently read a positive amount, set amount to 0.",
+    "- amount: the primary total amount charged or paid, as shown in the image. Look carefully, even if the text is small, blurry, or partially compressed, and report your best-effort reading of that amount.",
+    "- Only set amount to 0 if there is truly no numeric amount visible anywhere in the image. Never guess or invent a number, and never default to 0 just because the text is slightly hard to read—read it as carefully as you can first.",
     "- description: merchant or payee name, or a short label for what the image shows.",
     "- subcategory: a specific line item if visible (e.g. Transport → Highway toll).",
     `- location: default "${DEFAULT_LOCATION}" unless the image or caption states another place.`,
@@ -531,7 +532,7 @@ function buildImageAnalysisPrompt(captionText, contextDateLabel) {
 async function parseTransactionFromImage(base64Image, mimeType, captionText, messageDate) {
   const contextDateLabel = formatContextDateLabel(messageDate);
   const completion = await openai.responses.create({
-    model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini",
+    model: process.env.OPENAI_VISION_MODEL || "gpt-4o",
     input: [
       {
         role: "system",
