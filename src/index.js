@@ -70,6 +70,73 @@ async function callTelegramApi(method, body) {
   }
 }
 
+/** Fetches the Telegram file_path for a file_id (needed to build the download URL). */
+async function getTelegramFile(fileId) {
+  const res = await axios.get(`${getTelegramApiBase()}/getFile`, {
+    params: { file_id: fileId },
+    timeout: telegramHttpTimeoutMs(),
+  });
+  if (!res.data?.ok) {
+    throw new Error(res.data?.description || "Telegram getFile failed");
+  }
+  const filePath = res.data.result?.file_path;
+  if (!filePath) {
+    throw new Error("Telegram getFile returned no file_path");
+  }
+  return filePath;
+}
+
+function getTelegramFileDownloadUrl(filePath) {
+  const t = process.env.TELEGRAM_BOT_TOKEN;
+  return `https://api.telegram.org/file/bot${String(t).trim()}/${filePath}`;
+}
+
+/** Downloads a Telegram-hosted file and returns it as base64 (for inline image input to OpenAI). */
+async function downloadTelegramFileAsBase64(filePath) {
+  const url = getTelegramFileDownloadUrl(filePath);
+  const res = await axios.get(url, {
+    responseType: "arraybuffer",
+    timeout: Math.max(30000, telegramHttpTimeoutMs()),
+  });
+  return Buffer.from(res.data).toString("base64");
+}
+
+/** Best-effort mime type from the Telegram file path extension; Telegram photos are usually .jpg. */
+function guessImageMimeType(filePath) {
+  const lower = String(filePath || "").toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".heic") || lower.endsWith(".heif")) return "image/heic";
+  return "image/jpeg";
+}
+
+/** Telegram sends multiple resolutions for a photo; pick the highest-resolution one for OCR quality. */
+function pickLargestPhoto(photoSizes) {
+  if (!Array.isArray(photoSizes) || !photoSizes.length) return null;
+  return photoSizes.reduce((best, p) => {
+    if (!best) return p;
+    const bestArea = (best.width || 0) * (best.height || 0);
+    const area = (p.width || 0) * (p.height || 0);
+    return area > bestArea ? p : best;
+  }, null);
+}
+
+/**
+ * Finds an image file_id on the message, whether sent as a compressed photo or as an
+ * uncompressed image document (Telegram "Send without compression").
+ */
+function extractImageFileId(message) {
+  const photo = pickLargestPhoto(message?.photo);
+  if (photo?.file_id) {
+    return { fileId: photo.file_id };
+  }
+  const doc = message?.document;
+  if (doc?.file_id && typeof doc.mime_type === "string" && doc.mime_type.startsWith("image/")) {
+    return { fileId: doc.file_id };
+  }
+  return null;
+}
+
 /**
  * Clears the client's loading state on inline buttons. Must not throw — runs before heavy work.
  * Uses a short timeout so the webhook can finish quickly even if Telegram is slow.
@@ -436,6 +503,61 @@ async function parseTransactionWithOpenAI(messageText, messageDate) {
   return JSON.parse(raw);
 }
 
+function buildImageAnalysisPrompt(captionText, contextDateLabel) {
+  const categoryList = allowedCategories.join(", ");
+  const captionLine =
+    captionText && captionText.trim()
+      ? `The user also added this caption: "${captionText.trim()}".`
+      : "No caption was provided.";
+  return [
+    `The user's message date context: ${contextDateLabel}.`,
+    "The attached image is a receipt or a screenshot of a payment (for example an iPhone Wallet payment confirmation).",
+    "Read the amount, merchant/payee, and any other details you can from the image itself.",
+    captionLine,
+    `Available categories (pick exactly one name or a close synonym; synonyms map via env): ${categoryList}.`,
+    `Never use "${RAW_SHEET}" as category—all rows are logged only there.`,
+    `For salary, incoming transfers, or money received, use type "income" and category "${INCOME_SHEET}".`,
+    "",
+    "Fill fields as follows:",
+    "- amount: the primary total amount charged or paid, as shown in the image. If you cannot confidently read a positive amount, set amount to 0.",
+    "- description: merchant or payee name, or a short label for what the image shows.",
+    "- subcategory: a specific line item if visible (e.g. Transport → Highway toll).",
+    `- location: default "${DEFAULT_LOCATION}" unless the image or caption states another place.`,
+    `- currency: default "${DEFAULT_CURRENCY}" unless the image clearly shows another currency symbol or code.`,
+    "- notes: empty string unless there is a clear extra detail worth keeping (e.g. last 4 card digits, transaction id); do not duplicate the description.",
+  ].join("\n");
+}
+
+async function parseTransactionFromImage(base64Image, mimeType, captionText, messageDate) {
+  const contextDateLabel = formatContextDateLabel(messageDate);
+  const completion = await openai.responses.create({
+    model: process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini",
+    input: [
+      {
+        role: "system",
+        content: `You analyze photos of receipts or payment screenshots for a family budget spreadsheet. Output strict JSON only. Today for context is ${contextDateLabel}.`,
+      },
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: buildImageAnalysisPrompt(captionText, contextDateLabel) },
+          { type: "input_image", image_url: `data:${mimeType};base64,${base64Image}` },
+        ],
+      },
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "transaction",
+        schema: transactionJsonSchema,
+      },
+    },
+  });
+
+  const raw = completion.output_text;
+  return JSON.parse(raw);
+}
+
 async function parseEditWithOpenAI(currentDraft, editInstruction, originalMessage) {
   const completion = await openai.responses.create({
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
@@ -736,12 +858,8 @@ function isCancelCommand(text) {
   return t === "/cancel" || t.startsWith("/cancel ");
 }
 
-async function processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate, messageThreadId) {
-  awaitingEditByChat.delete(chatId);
-  const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
-  await sendTelegramMessage(chatId, "⏳ Analyzing your message...", messageId, undefined, threadExtras);
-
-  const parsed = await parseTransactionWithOpenAI(originalMessage, messageDate);
+async function presentDraftForConfirmation(parsed, context) {
+  const { chatId, originalMessage, sender, messageId, messageDate, messageThreadId } = context;
   const draft = normalizeDraft(parsed, messageDate);
   const categorySheetName = draft.category;
 
@@ -758,10 +876,50 @@ async function processExpenseFlow(chatId, originalMessage, sender, messageId, me
     messageThreadId,
   });
 
+  const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
   const preview = formatDraftPreview(draft, categorySheetName);
   const keyboard = buildConfirmKeyboard(token);
 
   await sendTelegramMessage(chatId, preview, messageId, keyboard, threadExtras);
+}
+
+async function processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate, messageThreadId) {
+  awaitingEditByChat.delete(chatId);
+  const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
+  await sendTelegramMessage(chatId, "⏳ Analyzing your message...", messageId, undefined, threadExtras);
+
+  const parsed = await parseTransactionWithOpenAI(originalMessage, messageDate);
+  await presentDraftForConfirmation(parsed, {
+    chatId,
+    originalMessage,
+    sender,
+    messageId,
+    messageDate,
+    messageThreadId,
+  });
+}
+
+async function processImageExpenseFlow(chatId, fileId, captionText, sender, messageId, messageDate, messageThreadId) {
+  awaitingEditByChat.delete(chatId);
+  const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
+  await sendTelegramMessage(chatId, "⏳ Reading your photo...", messageId, undefined, threadExtras);
+
+  const filePath = await getTelegramFile(fileId);
+  const base64Image = await downloadTelegramFileAsBase64(filePath);
+  const mimeType = guessImageMimeType(filePath);
+
+  const parsed = await parseTransactionFromImage(base64Image, mimeType, captionText, messageDate);
+  const originalMessageLabel =
+    captionText && captionText.trim() ? `[photo] ${captionText.trim()}` : "[photo]";
+
+  await presentDraftForConfirmation(parsed, {
+    chatId,
+    originalMessage: originalMessageLabel,
+    sender,
+    messageId,
+    messageDate,
+    messageThreadId,
+  });
 }
 
 async function processEditInstruction(chatId, editText, messageId, messageThreadId) {
@@ -1014,6 +1172,7 @@ app.post("/webhook/telegram", async (req, res) => {
     }
     const chatId = message?.chat?.id;
     const originalMessage = message?.text;
+    const imageInput = extractImageFileId(message);
     const sender =
       message?.from?.first_name ||
       message?.from?.username ||
@@ -1022,7 +1181,7 @@ app.post("/webhook/telegram", async (req, res) => {
     const messageThreadId = message?.message_thread_id;
     const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
 
-    if (!chatId || !originalMessage) {
+    if (!chatId || (!originalMessage && !imageInput)) {
       return ok();
     }
 
@@ -1055,6 +1214,21 @@ app.post("/webhook/telegram", async (req, res) => {
     }
 
     try {
+      if (imageInput) {
+        /** A photo always starts a fresh draft; it is never treated as a reply to a pending edit. */
+        awaitingEditByChat.delete(chatId);
+        await processImageExpenseFlow(
+          chatId,
+          imageInput.fileId,
+          message?.caption,
+          sender,
+          messageId,
+          messageDate,
+          messageThreadId
+        );
+        return ok();
+      }
+
       if (awaitingEditByChat.has(chatId)) {
         const handled = await processEditInstruction(
           chatId,

@@ -69,6 +69,17 @@ curl -X POST "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
   -d "url=https://<your-public-url>/webhook/telegram"
 ```
 
+## Photos (receipts / payment screenshots)
+
+Send a photo instead of text (with or without a caption) and the bot reads it the same way:
+
+- Compressed Telegram photos and uncompressed image documents (image/* mime type) are both accepted.
+- The highest-resolution version Telegram provides is downloaded and sent to OpenAI as an image input — no separate OCR step.
+- Works for printed/handwritten receipts and screenshots such as iPhone Wallet payment confirmations.
+- If the amount can't be confidently read, the bot replies with an error instead of guessing — send a clearer photo or fall back to a text message.
+- Optional `OPENAI_VISION_MODEL` env var to use a different model for images than `OPENAI_MODEL`; defaults to the same model.
+- The same Yes/Edit confirmation flow applies before anything is written to the sheet.
+
 ## Row shape appended by the app
 
 **Category tab:** date (ISO), time, amount, type, category name, description.
