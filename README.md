@@ -84,9 +84,13 @@ Send a photo instead of text (with or without a caption) and the bot reads it th
 
 **Category tab:** date (ISO), time, amount, type, category name, description.
 
-**RAW tab:** UTC-ish datetime string, sender, original message, amount, type, category name, description, date, time.
+**RAW tab:** date (dd/mm/yyyy), type (Income/Expense), category, subcategory, description, location, amount, currency, sum in HKD (blank — calculated by a sheet formula), notes, sender (Telegram @tag or name), payment method.
 
 Align headers in the sheet with these columns or adjust the code if your layout differs.
+
+**Sender:** the Telegram `@username` of whoever sent the message/photo (falls back to first name, then Telegram user id, if no username is set). Shown in the confirmation preview as "Logged by" and stored in every RAW row.
+
+**Payment method:** how the transaction was paid, read from the message text or the photo (e.g. "BOC VISA Infinite", "Cash", "HSBC transfer"). The model is instructed to only report what it can actually read/infer — it uses "Unknown" rather than guessing a bank or card it can't confirm.
 
 ## Behavior
 

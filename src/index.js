@@ -401,8 +401,19 @@ const transactionJsonSchema = {
     location: { type: "string" },
     currency: { type: "string" },
     notes: { type: "string" },
+    paymentMethod: { type: "string" },
   },
-  required: ["amount", "description", "category", "subcategory", "type", "location", "currency", "notes"],
+  required: [
+    "amount",
+    "description",
+    "category",
+    "subcategory",
+    "type",
+    "location",
+    "currency",
+    "notes",
+    "paymentMethod",
+  ],
   additionalProperties: false,
 };
 
@@ -421,6 +432,7 @@ function buildAnalysisPrompt(messageText, contextDateLabel) {
     `- location: default "${DEFAULT_LOCATION}" unless the message states another place.`,
     `- currency: default "${DEFAULT_CURRENCY}" unless the message states another currency.`,
     `- notes: empty string unless the user explicitly adds an extra note beyond amount/description; do not duplicate the description.`,
+    `- paymentMethod: if the message names how it was paid (e.g. cash, a specific card, or bank), be as precise as the message allows (e.g. "BOC Visa", "HSBC transfer", "Cash"). If nothing is mentioned, use "Unknown". Never invent a payment method.`,
     "",
     `User message:\n${messageText}`,
   ].join("\n");
@@ -430,6 +442,7 @@ function buildEditPrompt(currentDraft, editInstruction, originalMessage) {
   const categoryList = allowedCategories.join(", ");
   return [
     "Apply the user's edit instructions to this draft. Keep other fields unchanged unless the edit implies them.",
+    "This includes paymentMethod: keep its current value unless the edit instruction explicitly changes the payment method.",
     `Allowed categories: ${categoryList}. Never use "${RAW_SHEET}" as category name.`,
     "",
     "Current draft (JSON):",
@@ -526,6 +539,7 @@ function buildImageAnalysisPrompt(captionText, contextDateLabel) {
     `- location: default "${DEFAULT_LOCATION}" unless the image or caption states another place.`,
     `- currency: default "${DEFAULT_CURRENCY}" unless the image clearly shows another currency symbol or code.`,
     "- notes: empty string unless there is a clear extra detail worth keeping (e.g. last 4 card digits, transaction id); do not duplicate the description.",
+    "- paymentMethod: read this as precisely as the image allows—bank name plus card type/tier if shown (e.g. \"BOC VISA Infinite\", \"DBS Mastercard\"), or \"Cash\" for cash receipts. If a card is shown but the bank/type isn't legible, use \"Card (unspecified)\". If there is no payment method visible at all, use \"Unknown\". Never invent a bank or card name that isn't actually visible.",
   ].join("\n");
 }
 
@@ -597,6 +611,7 @@ function normalizeDraft(result, messageDate) {
     location: String(result.location || "").trim() || DEFAULT_LOCATION,
     currency: String(result.currency || "").trim() || DEFAULT_CURRENCY,
     notes: String(result.notes || "").trim(),
+    paymentMethod: String(result.paymentMethod || "").trim() || "Unknown",
     /** dd/mm/yyyy for RAW sheet (from message time) */
     dateDdMmYyyy: formatDateDdMmYyyy(md),
   };
@@ -653,6 +668,8 @@ function formatDraftPreview(draft, categorySheetName) {
     `Sum: ${draft.amount}`,
     `Currency: ${draft.currency}`,
     "Sum (HKD): (leave blank — calculated in sheet)",
+    `Payment method: ${draft.paymentMethod || "Unknown"}`,
+    `Logged by: ${draft.sender || "Unknown"}`,
     notesLine,
     "",
     "Does this look good?",
@@ -673,6 +690,8 @@ function buildRawRowValues(draft, categorySheetName) {
     draft.currency,
     "",
     notesCell,
+    draft.sender || "Unknown",
+    draft.paymentMethod || "Unknown",
   ];
 }
 
@@ -862,6 +881,7 @@ function isCancelCommand(text) {
 async function presentDraftForConfirmation(parsed, context) {
   const { chatId, originalMessage, sender, messageId, messageDate, messageThreadId } = context;
   const draft = normalizeDraft(parsed, messageDate);
+  draft.sender = sender || "Unknown";
   const categorySheetName = draft.category;
 
   prunePending();
@@ -961,12 +981,14 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
     location: entry.draft.location,
     currency: entry.draft.currency,
     notes: entry.draft.notes,
+    paymentMethod: entry.draft.paymentMethod,
   };
 
   try {
     await sendTelegramMessage(chatId, "⏳ Updating your draft...", messageId, undefined, threadExtras);
     const parsed = await parseEditWithOpenAI(flatDraft, editText, entry.originalMessage);
     const draft = normalizeDraft(parsed, entry.messageDate);
+    draft.sender = entry.sender || "Unknown";
     const categorySheetName = draft.category;
 
     pendingByToken.delete(wait.token);
@@ -1174,10 +1196,9 @@ app.post("/webhook/telegram", async (req, res) => {
     const chatId = message?.chat?.id;
     const originalMessage = message?.text;
     const imageInput = extractImageFileId(message);
-    const sender =
-      message?.from?.first_name ||
-      message?.from?.username ||
-      `${message?.from?.id || "Unknown"}`;
+    const senderTag = message?.from?.username ? `@${message.from.username}` : null;
+    const senderFallback = message?.from?.first_name || `${message?.from?.id || "Unknown"}`;
+    const sender = senderTag || senderFallback;
     const messageId = message?.message_id;
     const messageThreadId = message?.message_thread_id;
     const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
