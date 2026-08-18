@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node src/index.js",
     "google-oauth-setup": "node scripts/google-oauth-setup.js",
-    "list-sheet-tabs": "node scripts/list-sheet-tabs.js"
+    "list-sheet-tabs": "node scripts/list-sheet-tabs.js",
+    "resolve-excel-share": "node scripts/resolve-excel-share.js",
+    "test-excel-write": "node scripts/test-excel-write.js",
+    "inspect-excel-structure": "node scripts/inspect-excel-structure.js"
   },
   "keywords": [],
   "author": "",

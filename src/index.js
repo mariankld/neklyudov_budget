@@ -3,23 +3,41 @@ const crypto = require("crypto");
 const express = require("express");
 const axios = require("axios");
 const OpenAI = require("openai");
-const { google } = require("googleapis");
+const { listWorkbookTables, appendTableRow } = require("./graphExcel");
 
 const app = express();
 app.use(express.json());
 
 const PORT = Number(process.env.PORT || 3000);
 
-/** Logical income category label stored in RAW (column 3); not required to be a sheet tab when using GOOGLE_CATEGORY_LIST. */
+/** Logical income category label stored in RAW (column 3); Income has no dedicated Excel table, RAW-only. */
 const INCOME_SHEET = (process.env.INCOME_SHEET_NAME || "Income").trim();
 const RAW_SHEET = (process.env.RAW_SHEET_NAME || "RAW").trim();
-/** Dashboard tab: never used as a category target or written by the logger. */
-const SUMMARY_TAB = (process.env.GOOGLE_SUMMARY_TAB || "Summary").trim();
 const DEFAULT_CURRENCY = (process.env.DEFAULT_EXPENSE_CURRENCY || "HKD").trim();
 const DEFAULT_LOCATION = (process.env.DEFAULT_EXPENSE_LOCATION || "Hong Kong").trim();
 const FAMILY_GREETING_NAME = (process.env.BUDGET_FAMILY_NAME || "Neklyudov").trim();
 
-/** Filled at startup from the spreadsheet (tab titles minus skip list). */
+/** Category label (as used in RAW / chosen by OpenAI) -> real Excel Table name in the workbook. */
+const CATEGORY_TABLE_MAP = {
+  "Credit Cards": "CreditCards",
+  "Shopping": "Shopping",
+  "Transportation": "TransportTable",
+  "Utilities": "Utilities",
+  "Entertainment": "Entertainment",
+  "Restaurants": "Restaurants",
+  "Family and Staff": "FamilyStaff",
+  "Personal Spending": "StaffExpenses",
+  "Other": "Other",
+  "Subscriptions": "TelecomSubscriptions",
+  "Travel": "Travel",
+  "Health": "Health",
+  "Education": "Education",
+  "Rent": "Rent",
+  "Insurance": "MedInsurance",
+  "CAPEX": "CAPEX",
+};
+
+/** Category labels the model may choose from: every expense category table plus Income (RAW-only). */
 let allowedCategories = [];
 
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
@@ -184,44 +202,6 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-function escapeGoogleSheetRangeTitle(sheetName) {
-  return `'${sheetName.replace(/'/g, "''")}'`;
-}
-
-function createGoogleSheetsClient() {
-  const oauth2Client = new google.auth.OAuth2(
-    String(process.env.GOOGLE_CLIENT_ID || "").trim(),
-    String(process.env.GOOGLE_CLIENT_SECRET || "").trim(),
-    (process.env.GOOGLE_OAUTH_REDIRECT_URI || "http://127.0.0.1:3001/oauth/callback").trim()
-  );
-  oauth2Client.setCredentials({
-    refresh_token: String(process.env.GOOGLE_REFRESH_TOKEN || "").trim(),
-  });
-  return google.sheets({ version: "v4", auth: oauth2Client });
-}
-
-function parseSkipTabNames() {
-  const extra = (process.env.GOOGLE_SKIP_TABS || "")
-    .split(/[|,\n]/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return new Set(extra);
-}
-
-/**
- * Optional explicit category names for OpenAI (Summary + RAW layout with no per-category tabs).
- * Comma-, pipe-, or newline-separated. When set, tabs are not scanned for categories.
- */
-function parseCategoryListFromEnv() {
-  const raw = (process.env.GOOGLE_CATEGORY_LIST || "").trim();
-  if (!raw) return null;
-  const list = raw
-    .split(/[|,\n]/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return list.length ? list : null;
-}
-
 function parseCategoryMappingEnv() {
   const raw = (process.env.CATEGORY_MAPPING || "").trim();
   if (!raw) return new Map();
@@ -271,125 +251,6 @@ function formatDateDdMmYyyy(date) {
   return `${d}/${m}/${y}`;
 }
 
-async function fetchSpreadsheetTabTitles(sheets, spreadsheetId) {
-  try {
-    const meta = await sheets.spreadsheets.get({
-      spreadsheetId,
-      fields: "sheets(properties(title))",
-    });
-    const sheetsList = meta.data.sheets || [];
-    return sheetsList
-      .map((s) => s.properties && s.properties.title)
-      .filter(Boolean);
-  } catch (err) {
-    if (isGoogleSheetsNotFoundError(err)) {
-      const idShort = String(spreadsheetId).slice(0, 8);
-      throw new Error(
-        `Google Sheets: spreadsheet not found or no access (id starting ${idShort}…). ` +
-          `Copy GOOGLE_SPREADSHEET_ID from the URL with no spaces; open the sheet with the same Google account you used for OAuth; share the file with that account if needed. ` +
-          `Original: ${err.message || err}`
-      );
-    }
-    throw err;
-  }
-}
-
-/**
- * Tabs the model may choose as expense/income *category labels* (stored in RAW only when using GOOGLE_CATEGORY_LIST).
- * Legacy mode: one tab per category plus RAW + Summary. RAW / Summary are excluded from this list.
- */
-function buildAllowedCategoriesFromTabs(allTitles) {
-  const skip = parseSkipTabNames();
-  skip.add(RAW_SHEET);
-  if (SUMMARY_TAB) skip.add(SUMMARY_TAB);
-  return allTitles.filter((t) => !skip.has(t));
-}
-
-async function logFirstRow(sheets, spreadsheetId, sheetLabel, sheetName) {
-  try {
-    const range = `${escapeGoogleSheetRangeTitle(sheetName)}!1:1`;
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range,
-    });
-    const row = res.data.values && res.data.values[0];
-    console.log(
-      `[structure] ${sheetLabel} "${sheetName}" row1:`,
-      row && row.length ? row.join(" | ") : "(empty)"
-    );
-  } catch (err) {
-    console.warn(`[structure] Could not read row1 of "${sheetName}": ${err.message}`);
-  }
-}
-
-function cellsRoughlyEqual(expected, actual) {
-  if (expected === actual) return true;
-  const ex = expected === null || expected === undefined ? "" : String(expected).trim();
-  const ac = actual === null || actual === undefined ? "" : String(actual).trim();
-  if (ex === ac) return true;
-  const nEx = Number(ex.replace(",", "."));
-  const nAc = Number(String(ac).replace(",", "."));
-  if (Number.isFinite(nEx) && Number.isFinite(nAc) && Math.abs(nEx - nAc) < 1e-9) {
-    return true;
-  }
-  return false;
-}
-
-/**
- * Triple-check: (1) append API says exactly one row written, (2) read-back row exists,
- * (3) critical fields match (amount + category), tolerating Sheets date/number display formatting.
- */
-async function appendRowAndVerify(
-  sheets,
-  spreadsheetId,
-  sheetName,
-  rowValues,
-  label,
-  criticalChecks
-) {
-  const range = `${escapeGoogleSheetRangeTitle(sheetName)}!A:Z`;
-  const appendRes = await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range,
-    valueInputOption: "USER_ENTERED",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: {
-      values: [rowValues],
-    },
-  });
-
-  const updates = appendRes.data?.updates;
-  const updatedRows = updates?.updatedRows;
-  const updatedRange = updates?.updatedRange;
-  if (updatedRows !== 1 || !updatedRange) {
-    throw new Error(
-      `${label}: Sheets append did not report a single new row (updatedRows=${updatedRows}).`
-    );
-  }
-
-  const readRes = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: updatedRange,
-    valueRenderOption: "UNFORMATTED_VALUE",
-    dateTimeRenderOption: "SERIAL_NUMBER",
-  });
-  const gotRow = readRes.data?.values?.[0];
-  if (!gotRow || !gotRow.length) {
-    throw new Error(`${label}: Read-back after append returned empty.`);
-  }
-
-  for (const { index, name, expected } of criticalChecks) {
-    const act = index < gotRow.length ? gotRow[index] : "";
-    if (!cellsRoughlyEqual(expected, act)) {
-      throw new Error(
-        `${label}: Verification failed for ${name} (expected "${expected}", got "${act}").`
-      );
-    }
-  }
-
-  return appendRes;
-}
-
 const transactionJsonSchema = {
   type: "object",
   properties: {
@@ -402,6 +263,7 @@ const transactionJsonSchema = {
     currency: { type: "string" },
     notes: { type: "string" },
     paymentMethod: { type: "string" },
+    recipient: { type: "string" },
   },
   required: [
     "amount",
@@ -413,6 +275,7 @@ const transactionJsonSchema = {
     "currency",
     "notes",
     "paymentMethod",
+    "recipient",
   ],
   additionalProperties: false,
 };
@@ -433,6 +296,7 @@ function buildAnalysisPrompt(messageText, contextDateLabel) {
     `- currency: default "${DEFAULT_CURRENCY}" unless the message states another currency.`,
     `- notes: empty string unless the user explicitly adds an extra note beyond amount/description; do not duplicate the description.`,
     `- paymentMethod: if the message names how it was paid (e.g. cash, a specific card, or bank), be as precise as the message allows (e.g. "BOC Visa", "HSBC transfer", "Cash"). If nothing is mentioned, use "Unknown". Never invent a payment method.`,
+    `- recipient: empty string unless the message names a specific person the payment was made to or received from (e.g. a staff member, family member, or vendor contact) — e.g. "Получатель: Yaya" or "for Maria". Never invent a name.`,
     "",
     `User message:\n${messageText}`,
   ].join("\n");
@@ -540,6 +404,7 @@ function buildImageAnalysisPrompt(captionText, contextDateLabel) {
     `- currency: default "${DEFAULT_CURRENCY}" unless the image clearly shows another currency symbol or code.`,
     "- notes: empty string unless there is a clear extra detail worth keeping (e.g. last 4 card digits, transaction id); do not duplicate the description.",
     "- paymentMethod: read this as precisely as the image allows—bank name plus card type/tier if shown (e.g. \"BOC VISA Infinite\", \"DBS Mastercard\"), or \"Cash\" for cash receipts. If a card is shown but the bank/type isn't legible, use \"Card (unspecified)\". If there is no payment method visible at all, use \"Unknown\". Never invent a bank or card name that isn't actually visible.",
+    "- recipient: empty string unless the image or caption names a specific person the payment was made to or received from (e.g. a staff member, family member, or vendor contact). Never invent a name.",
   ].join("\n");
 }
 
@@ -612,6 +477,7 @@ function normalizeDraft(result, messageDate) {
     currency: String(result.currency || "").trim() || DEFAULT_CURRENCY,
     notes: String(result.notes || "").trim(),
     paymentMethod: String(result.paymentMethod || "").trim() || "Unknown",
+    recipient: String(result.recipient || "").trim(),
     /** dd/mm/yyyy for RAW sheet (from message time) */
     dateDdMmYyyy: formatDateDdMmYyyy(md),
   };
@@ -669,6 +535,7 @@ function formatDraftPreview(draft, categorySheetName) {
     `Currency: ${draft.currency}`,
     "Sum (HKD): (leave blank — calculated in sheet)",
     `Payment method: ${draft.paymentMethod || "Unknown"}`,
+    `Recipient: ${draft.recipient && draft.recipient.length ? draft.recipient : "—"}`,
     `Logged by: ${draft.sender || "Unknown"}`,
     notesLine,
     "",
@@ -695,16 +562,74 @@ function buildRawRowValues(draft, categorySheetName) {
   ];
 }
 
-async function appendTransactionToSheets(draft, categorySheetName) {
-  const spreadsheetId = getSpreadsheetIdFromEnv();
-  const sheets = createGoogleSheetsClient();
-  const rawRow = buildRawRowValues(draft, categorySheetName);
+/**
+ * Column order for every expense category Excel Table (17 columns), confirmed live via
+ * inspect-excel-structure.js: Дата, Категория, Описание, Локация, Сумма, Валюта, Курс,
+ * Сумма (HKD), Примечание, Метод оплаты, Получатель/Сотрудник, Страховка, Статус выплаты,
+ * Пользователь, Страховая компания, Период покрытия, Карта.
+ *
+ * Категория here is RAW's Subcategory (precision line item), not RAW's Category — confirmed
+ * with Mariya. Курс and Сумма (HKD) are Excel formulas (exchange rate lookup) and must never
+ * be written by the bot. Страховка / Статус выплаты / Страховая компания / Период покрытия /
+ * Карта are not populated by the Telegram flow and are left blank.
+ */
+function buildCategoryRowValues(draft) {
+  const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
 
-  await appendRowAndVerify(sheets, spreadsheetId, RAW_SHEET, rawRow, `RAW "${RAW_SHEET}"`, [
-    { index: 1, name: "type", expected: draft.type === "income" ? "Income" : "Expense" },
-    { index: 2, name: "category", expected: categorySheetName },
-    { index: 6, name: "amount", expected: draft.amount },
-  ]);
+  return [
+    draft.dateDdMmYyyy, // Дата
+    draft.subcategory, // Категория
+    draft.description, // Описание
+    draft.location, // Локация
+    draft.amount, // Сумма
+    draft.currency, // Валюта
+    "", // Курс — Excel formula, never written here
+    "", // Сумма (HKD) — Excel formula, never written here
+    notesCell, // Примечание
+    draft.paymentMethod || "Unknown", // Метод оплаты
+    draft.recipient || "", // Получатель/Сотрудник
+    "", // Страховка — not tracked by the bot
+    "", // Статус выплаты — not tracked by the bot
+    draft.sender || "Unknown", // Пользователь
+    "", // Страховая компания — not tracked by the bot
+    "", // Период покрытия — not tracked by the bot
+    "", // Карта — not tracked by the bot
+  ];
+}
+
+/**
+ * Writes RAW first (always), then the matching category Excel Table for expenses only
+ * (income has no dedicated table — RAW is the sole record). These are two independent
+ * Graph API calls: if RAW succeeds but the category write fails, the thrown error is tagged
+ * with rawSucceeded=true so the caller never retries (which would duplicate the RAW row).
+ */
+async function appendTransactionToExcel(draft) {
+  const driveId = getExcelDriveIdFromEnv();
+  const itemId = getExcelItemIdFromEnv();
+  const rawRow = buildRawRowValues(draft, draft.category);
+
+  await appendTableRow(driveId, itemId, RAW_SHEET, rawRow);
+
+  if (draft.type !== "expense") {
+    return;
+  }
+
+  const tableName = CATEGORY_TABLE_MAP[draft.category];
+  if (!tableName) {
+    const err = new Error(
+      `RAW was logged, but "${draft.category}" has no matching Excel Table configured (CATEGORY_TABLE_MAP).`
+    );
+    err.rawSucceeded = true;
+    throw err;
+  }
+
+  try {
+    const categoryRow = buildCategoryRowValues(draft);
+    await appendTableRow(driveId, itemId, tableName, categoryRow);
+  } catch (err) {
+    err.rawSucceeded = true;
+    throw err;
+  }
 }
 
 function isStartCommand(text) {
@@ -736,17 +661,14 @@ function requireEnv(name) {
   }
 }
 
-function getSpreadsheetIdFromEnv() {
-  const v = process.env.GOOGLE_SPREADSHEET_ID;
+function getExcelDriveIdFromEnv() {
+  const v = process.env.EXCEL_DRIVE_ID;
   return v ? String(v).trim() : "";
 }
 
-function isGoogleSheetsNotFoundError(err) {
-  const msg = (err && (err.message || err.toString())) || "";
-  const code = err && (err.code || err.response?.status);
-  const reason = err?.response?.data?.error?.errors?.[0]?.reason;
-  if (code === 404 || reason === "notFound") return true;
-  return /not found|NOT_FOUND|Requested entity was not found/i.test(msg);
+function getExcelItemIdFromEnv() {
+  const v = process.env.EXCEL_ITEM_ID;
+  return v ? String(v).trim() : "";
 }
 
 /**
@@ -811,66 +733,40 @@ async function ensureTelegramWebhook() {
 async function bootstrap() {
   requireEnv("TELEGRAM_BOT_TOKEN");
   requireEnv("OPENAI_API_KEY");
-  requireEnv("GOOGLE_SPREADSHEET_ID");
-  requireEnv("GOOGLE_CLIENT_ID");
-  requireEnv("GOOGLE_CLIENT_SECRET");
-  requireEnv("GOOGLE_REFRESH_TOKEN");
+  requireEnv("AZURE_TENANT_ID");
+  requireEnv("AZURE_CLIENT_ID");
+  requireEnv("AZURE_CLIENT_SECRET");
+  requireEnv("EXCEL_DRIVE_ID");
+  requireEnv("EXCEL_ITEM_ID");
 
-  const sheets = createGoogleSheetsClient();
-  const spreadsheetId = getSpreadsheetIdFromEnv();
-  if (!spreadsheetId) {
-    throw new Error("GOOGLE_SPREADSHEET_ID is empty after trim.");
-  }
-
-  const tabTitles = await fetchSpreadsheetTabTitles(sheets, spreadsheetId);
-  if (!tabTitles.length) {
-    throw new Error("Spreadsheet has no sheet tabs.");
-  }
-
-  if (!tabTitles.includes(RAW_SHEET)) {
-    throw new Error(
-      `RAW tab "${RAW_SHEET}" not found. Available tabs: ${tabTitles.join(", ")}. Set RAW_SHEET_NAME in .env.`
-    );
-  }
+  const driveId = getExcelDriveIdFromEnv();
+  const itemId = getExcelItemIdFromEnv();
 
   categoryAliasMap = parseCategoryMappingEnv();
-
-  const fromEnv = parseCategoryListFromEnv();
-  if (fromEnv) {
-    allowedCategories = fromEnv;
-  } else {
-    allowedCategories = buildAllowedCategoriesFromTabs(tabTitles);
-    if (!tabTitles.includes(INCOME_SHEET)) {
-      throw new Error(
-        `Income tab "${INCOME_SHEET}" not found. Available tabs: ${tabTitles.join(", ")}. Set INCOME_SHEET_NAME in .env or set GOOGLE_CATEGORY_LIST.`
-      );
-    }
-  }
-
-  if (!allowedCategories.length) {
-    throw new Error(
-      'No categories configured. Set GOOGLE_CATEGORY_LIST (for Summary+RAW-only spreadsheets) or add category tabs and GOOGLE_SKIP_TABS as needed.'
-    );
-  }
-
-  if (!allowedCategories.includes(INCOME_SHEET)) {
-    throw new Error(
-      fromEnv
-        ? `GOOGLE_CATEGORY_LIST must include the income label "${INCOME_SHEET}" (see INCOME_SHEET_NAME).`
-        : `Income tab "${INCOME_SHEET}" was excluded. Remove it from GOOGLE_SKIP_TABS if listed there.`
-    );
-  }
+  allowedCategories = [...Object.keys(CATEGORY_TABLE_MAP), INCOME_SHEET];
 
   console.log(
-    `Budget logger: ${allowedCategories.length} categories — ${allowedCategories.join(", ")}` +
-      (fromEnv ? " (from GOOGLE_CATEGORY_LIST)" : " (from sheet tabs)")
+    `Budget logger: ${allowedCategories.length} categories — ${allowedCategories.join(", ")}`
   );
-  console.log(`Every transaction is appended once to "${RAW_SHEET}" only.`);
+  console.log(
+    `Every transaction is appended to "${RAW_SHEET}"; expenses are also appended to their category Excel Table.`
+  );
   if (categoryAliasMap.size) {
     console.log(`Category aliases loaded: ${categoryAliasMap.size}`);
   }
 
-  await logFirstRow(sheets, spreadsheetId, "RAW log", RAW_SHEET);
+  /** Startup sanity check: confirm RAW and every mapped category table actually exist in the live workbook. */
+  const tables = await listWorkbookTables(driveId, itemId);
+  const liveTableNames = new Set((tables || []).map((t) => t.name || t.id));
+  const requiredTableNames = [RAW_SHEET, ...Object.values(CATEGORY_TABLE_MAP)];
+  const missing = requiredTableNames.filter((name) => !liveTableNames.has(name));
+  if (missing.length) {
+    throw new Error(
+      `Excel workbook is missing expected table(s): ${missing.join(", ")}. ` +
+        `Found tables: ${[...liveTableNames].join(", ")}. Check CATEGORY_TABLE_MAP / EXCEL_DRIVE_ID / EXCEL_ITEM_ID.`
+    );
+  }
+  console.log(`Excel workbook check OK: ${requiredTableNames.length} required tables found.`);
 }
 
 function isCancelCommand(text) {
@@ -982,6 +878,7 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
     currency: entry.draft.currency,
     notes: entry.draft.notes,
     paymentMethod: entry.draft.paymentMethod,
+    recipient: entry.draft.recipient,
   };
 
   try {
@@ -1088,14 +985,15 @@ async function handleCallbackQuery(callbackQuery) {
         : callbackExtras;
 
     try {
-      await appendTransactionToSheets(entry.draft, entry.draft.category);
+      await appendTransactionToExcel(entry.draft);
       completedLogByToken.set(token, Date.now());
 
       const cat = entry.draft.category;
       const dLabel = entry.draft.dateDdMmYyyy;
+      const tableNote = entry.draft.type === "expense" ? ` and "${cat}"` : "";
       const successText =
         `✅ Logged successfully.\n` +
-        `Verified in Google Sheets tab "${RAW_SHEET}" (${cat}).\n` +
+        `Saved to "${RAW_SHEET}"${tableNote}.\n` +
         `${entry.draft.amount} ${entry.draft.currency} · ${dLabel}`;
 
       try {
@@ -1112,19 +1010,35 @@ async function handleCallbackQuery(callbackQuery) {
       awaitingEditByChat.delete(chatId);
     } catch (err) {
       console.error("Log callback error:", err.message);
-      pendingByToken.set(token, entry);
 
       const failDetail = (err.message || "Unknown error").slice(0, 400);
-      try {
-        await sendTelegramMessage(
-          chatId,
-          `❌ Log failed — nothing new was saved to the sheet.\n${failDetail}`,
-          null,
-          undefined,
-          entryThreadExtras
-        );
-      } catch (notifyError) {
-        console.error("Failed to send Telegram error:", notifyError.message);
+      if (err.rawSucceeded) {
+        /** RAW already has this row — do NOT restore to pendingByToken, a retry would duplicate it. */
+        completedLogByToken.set(token, Date.now());
+        try {
+          await sendTelegramMessage(
+            chatId,
+            `⚠️ Logged to "${RAW_SHEET}" but the "${entry.draft.category}" table write failed — check the workbook.\n${failDetail}`,
+            null,
+            undefined,
+            entryThreadExtras
+          );
+        } catch (notifyError) {
+          console.error("Failed to send Telegram error:", notifyError.message);
+        }
+      } else {
+        pendingByToken.set(token, entry);
+        try {
+          await sendTelegramMessage(
+            chatId,
+            `❌ Log failed — nothing was saved.\n${failDetail}`,
+            null,
+            undefined,
+            entryThreadExtras
+          );
+        } catch (notifyError) {
+          console.error("Failed to send Telegram error:", notifyError.message);
+        }
       }
     } finally {
       inflightLogTokens.delete(token);
