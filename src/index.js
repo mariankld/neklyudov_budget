@@ -1110,9 +1110,14 @@ app.post("/webhook/telegram", async (req, res) => {
     const chatId = message?.chat?.id;
     const originalMessage = message?.text;
     const imageInput = extractImageFileId(message);
-    const senderTag = message?.from?.username ? `@${message.from.username}` : null;
+    // No leading "@" here: this workbook has Excel's Lotus transition formula
+    // entry compatibility active, which silently reinterprets any cell value
+    // starting with "@" as a formula (e.g. "@name" -> "=name"), producing
+    // #NAME? errors and — because it's a Table calculated column — smearing
+    // that single bad result across every row in the column.
+    const senderUsername = message?.from?.username || null;
     const senderFallback = message?.from?.first_name || `${message?.from?.id || "Unknown"}`;
-    const sender = senderTag || senderFallback;
+    const sender = senderUsername || senderFallback;
     const messageId = message?.message_id;
     const messageThreadId = message?.message_thread_id;
     const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
