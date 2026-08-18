@@ -76,14 +76,27 @@ async function listWorkbookTables(driveId, itemId) {
  */
 async function appendTableRow(driveId, itemId, tableName, values) {
   const token = await getAccessToken();
-  const { data } = await axios.post(
-    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
-      tableName
-    )}')/rows`,
-    { values: [values] },
-    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
-  );
-  return data;
+  try {
+    const { data } = await axios.post(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
+        tableName
+      )}')/rows`,
+      { values: [values] },
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+    );
+    return data;
+  } catch (err) {
+    // Graph's real error (bad column count, invalid value for a calculated
+    // column, etc.) is in the response body — axios's err.message is just
+    // "Request failed with status code 400" and hides it. Surface it so it
+    // actually reaches the logs / Telegram error message.
+    if (err.response && err.response.data) {
+      const graphError = err.response.data.error || err.response.data;
+      err.graphDetail = `[${tableName}] ${graphError.code || ''} ${graphError.message || JSON.stringify(graphError)}`.trim();
+      err.message = err.graphDetail;
+    }
+    throw err;
+  }
 }
 
 module.exports = {
