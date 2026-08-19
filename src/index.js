@@ -563,15 +563,20 @@ function buildRawRowValues(draft, categorySheetName) {
 }
 
 /**
- * Column order for every expense category Excel Table (17 columns), confirmed live via
- * inspect-excel-structure.js: Дата, Категория, Описание, Локация, Сумма, Валюта, Курс,
- * Сумма (HKD), Примечание, Метод оплаты, Получатель/Сотрудник, Страховка, Статус выплаты,
- * Пользователь, Страховая компания, Период покрытия, Карта.
+ * Column order for every expense category Excel Table (12 columns) as of 2026-08-19:
+ * Дата, Категория, Описание, Локация, Сумма, Валюта, Курс, Сумма (HKD), Примечание,
+ * Метод оплаты, Получатель/Сотрудник, Пользователь.
+ *
+ * Mariya removed the 5 unused insurance columns (Страховка, Статус выплаты, Страховая
+ * компания, Период покрытия, Карта) from every expense category table on 2026-08-19,
+ * shrinking each table from 17 to 12 columns. The bot's old fixed 17-value write then
+ * failed with Graph's InvalidArgument "number of rows or columns doesn't match". Пользователь
+ * is now the last column instead of being sandwiched among the insurance fields — do not
+ * reorder it back without re-confirming the live table layout.
  *
  * Категория here is RAW's Subcategory (precision line item), not RAW's Category — confirmed
  * with Mariya. Курс and Сумма (HKD) are Excel formulas (exchange rate lookup) and must never
- * be written by the bot. Страховка / Статус выплаты / Страховая компания / Период покрытия /
- * Карта are not populated by the Telegram flow and are left blank.
+ * be written by the bot.
  */
 function buildCategoryRowValues(draft) {
   const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
@@ -588,12 +593,7 @@ function buildCategoryRowValues(draft) {
     notesCell, // Примечание
     draft.paymentMethod || "Unknown", // Метод оплаты
     draft.recipient || "", // Получатель/Сотрудник
-    "", // Страховка — not tracked by the bot
-    "", // Статус выплаты — not tracked by the bot
     draft.sender || "Unknown", // Пользователь
-    "", // Страховая компания — not tracked by the bot
-    "", // Период покрытия — not tracked by the bot
-    "", // Карта — not tracked by the bot
   ];
 }
 
