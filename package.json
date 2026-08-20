@@ -1,7 +1,7 @@
 {
   "name": "neklyudov_budget",
   "version": "1.0.0",
-  "description": "Telegram to Google Sheets budget logger using OpenAI parsing",
+  "description": "Telegram to Excel (SharePoint, via Microsoft Graph) budget logger using OpenAI parsing",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -9,7 +9,11 @@
     "list-sheet-tabs": "node scripts/list-sheet-tabs.js",
     "resolve-excel-share": "node scripts/resolve-excel-share.js",
     "test-excel-write": "node scripts/test-excel-write.js",
-    "inspect-excel-structure": "node scripts/inspect-excel-structure.js"
+    "inspect-excel-structure": "node scripts/inspect-excel-structure.js",
+    "lookup-historical-rate": "node scripts/lookup-historical-rate.js",
+    "audit-summary": "node scripts/audit-summary-formulas.js",
+    "fix-summary": "node scripts/fix-summary-formulas.js",
+    "fix-h20-credit-card": "node scripts/fix-h20-credit-card-total.js"
   },
   "keywords": [],
   "author": "",

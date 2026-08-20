@@ -1,9 +1,14 @@
 require("dotenv").config();
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
 const axios = require("axios");
 const OpenAI = require("openai");
 const { listWorkbookTables, appendTableRow } = require("./graphExcel");
+const fxRates = require("./fxRates");
+const { computeSyncHash, runSync, formatSyncReport } = require("./syncJob");
+const { refreshCurrencyRatesTable, formatDailyJobsReport } = require("./dailyJobs");
 
 const app = express();
 app.use(express.json());
@@ -13,6 +18,12 @@ const PORT = Number(process.env.PORT || 3000);
 /** Logical income category label stored in RAW (column 3); Income has no dedicated Excel table, RAW-only. */
 const INCOME_SHEET = (process.env.INCOME_SHEET_NAME || "Income").trim();
 const RAW_SHEET = (process.env.RAW_SHEET_NAME || "RAW").trim();
+/** Optional audit-log table for every newly-fetched historical FX rate. Bot logs to it best-effort; missing table never blocks an expense write. */
+const EXCHANGE_RATE_HISTORY_TABLE = (process.env.EXCHANGE_RATE_HISTORY_TABLE || "ExchangeRateHistory").trim();
+/** "Today's rate" lookup table refreshed daily for anyone manually typing rows into Excel — see dailyJobs.js. */
+const CURRENCY_RATES_TABLE_NAME = (process.env.CURRENCY_RATES_TABLE_NAME || "CurrencyRates").trim();
+/** Optional chat id to receive daily-maintenance-job reports (CurrencyRates refresh + RAW<->category sync). If unset, reports are just logged to the console. */
+const REPORT_CHAT_ID = process.env.TELEGRAM_REPORT_CHAT_ID ? String(process.env.TELEGRAM_REPORT_CHAT_ID).trim() : "";
 const DEFAULT_CURRENCY = (process.env.DEFAULT_EXPENSE_CURRENCY || "HKD").trim();
 const DEFAULT_LOCATION = (process.env.DEFAULT_EXPENSE_LOCATION || "Hong Kong").trim();
 const FAMILY_GREETING_NAME = (process.env.BUDGET_FAMILY_NAME || "Neklyudov").trim();
@@ -37,6 +48,88 @@ const CATEGORY_TABLE_MAP = {
   "CAPEX": "CAPEX",
 };
 
+/**
+ * Enumerated set of Payment Method values. Everything written to the workbook must be exactly
+ * one of these strings — no free text — so Summary tab SUMIF/SUMIFS formulas that match on
+ * Payment Method (e.g. "*Visa BOC*") never silently miss a row because of a syntax variant like
+ * "VISA" or "Boc Visa". When OpenAI can't tell which one applies from the message/receipt, it
+ * returns PAYMENT_METHOD_UNCLEAR and the user is asked to pick via Telegram buttons before the
+ * transaction can be confirmed.
+ *
+ * CREDIT_CARD_PAYMENT_METHODS is the ONLY list the Summary!H20 "spent on credit cards" formula
+ * matches against (see scripts/fix-h20-credit-card-total.js) — Octopus, WeChat Pay, and any
+ * learned custom method are payment methods but never count as a credit card, so they must never
+ * be added to this array.
+ */
+const CREDIT_CARD_PAYMENT_METHODS = ["Master SC", "Visa BOC", "Master BEA", "Master Citic"];
+const OTHER_PAYMENT_METHODS = ["Cash", "Bank Transfer", "Octopus", "WeChat Pay"];
+const BASE_PAYMENT_METHODS = [...CREDIT_CARD_PAYMENT_METHODS, ...OTHER_PAYMENT_METHODS];
+const PAYMENT_METHOD_UNCLEAR = "Unclear";
+
+/**
+ * Learned payment methods (e.g. "PayMe", "AliPay") the user has confirmed via the Telegram
+ * "add this as a payment method?" prompt — see maybeAddCustomPaymentMethod / the `newpm:`
+ * callback branch. Never credit cards (that requires a code change + explicit review, since it
+ * changes the Summary credit-card total). Persisted to CUSTOM_PAYMENT_METHODS_FILE so they
+ * survive a restart; loaded once at bootstrap.
+ */
+const CUSTOM_PAYMENT_METHODS_FILE = path.join(__dirname, "..", "data", "customPaymentMethods.json");
+let customPaymentMethods = [];
+
+function loadCustomPaymentMethods() {
+  try {
+    const raw = fs.readFileSync(CUSTOM_PAYMENT_METHODS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    customPaymentMethods = Array.isArray(parsed)
+      ? parsed.filter((v) => typeof v === "string" && v.trim()).map((v) => v.trim())
+      : [];
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.error("loadCustomPaymentMethods: failed to read/parse, starting empty:", err.message);
+    }
+    customPaymentMethods = [];
+  }
+}
+
+function saveCustomPaymentMethods() {
+  try {
+    fs.mkdirSync(path.dirname(CUSTOM_PAYMENT_METHODS_FILE), { recursive: true });
+    fs.writeFileSync(CUSTOM_PAYMENT_METHODS_FILE, JSON.stringify(customPaymentMethods, null, 2));
+  } catch (err) {
+    // Best-effort: the new method still works for the rest of this process's lifetime even if
+    // the write fails (e.g. read-only filesystem) — it just won't survive a restart.
+    console.error("saveCustomPaymentMethods: failed to persist:", err.message);
+  }
+}
+
+/** Full current list of valid Payment Method values — base (fixed) + any learned custom ones. */
+function getPaymentMethods() {
+  return [...BASE_PAYMENT_METHODS, ...customPaymentMethods];
+}
+
+/** Case-insensitive exact match against the current known list; returns the canonical stored casing, or null. */
+function findKnownPaymentMethod(raw) {
+  const needle = String(raw || "").trim().toLowerCase();
+  if (!needle) return null;
+  return getPaymentMethods().find((m) => m.toLowerCase() === needle) || null;
+}
+
+/**
+ * Records a brand-new payment method the user just confirmed via the `newpm:...:y` button.
+ * Never a credit card — adding a card requires a deliberate code change since it changes the
+ * Summary!H20 credit-card total, which the owner reviews by hand (see fix-h20-credit-card-total.js).
+ */
+function addCustomPaymentMethod(name) {
+  const clean = String(name || "").trim();
+  if (!clean) return null;
+  const existing = findKnownPaymentMethod(clean);
+  if (existing) return existing;
+  customPaymentMethods.push(clean);
+  saveCustomPaymentMethods();
+  console.log(`Payment method learned: "${clean}" (now ${getPaymentMethods().length} total).`);
+  return clean;
+}
+
 /** Category labels the model may choose from: every expense category table plus Income (RAW-only). */
 let allowedCategories = [];
 
@@ -50,6 +143,16 @@ const completedLogByToken = new Map();
 
 /** Tokens currently being written (guards parallel webhook deliveries / double-tap races). */
 const inflightLogTokens = new Set();
+
+/**
+ * token -> Promise<{ok:boolean, detail?:string}> for the in-flight write. Telegram sometimes
+ * redelivers the same callback_query (e.g. if our ack was slow), so a second tap of the same
+ * button can arrive while the first is still writing to Excel. Rather than replying with a
+ * static "still saving" message — which can land in the chat *after* the real "✅ Logged
+ * successfully" message once the original finishes, looking like a stale/confusing bug — the
+ * duplicate awaits this same promise and reports the actual outcome.
+ */
+const inflightLogPromises = new Map();
 
 /** chatId -> { token } — user clicked Edit and should reply with changes */
 const awaitingEditByChat = new Map();
@@ -198,6 +301,67 @@ function buildConfirmKeyboard(token) {
   };
 }
 
+/**
+ * Shown instead of buildConfirmKeyboard whenever a draft's paymentMethod is PAYMENT_METHOD_UNCLEAR
+ * (OpenAI couldn't tell how the transaction was paid). One button per known getPaymentMethods()
+ * entry (base + any learned custom methods); callback_data encodes the token + the entry's index
+ * into that same list so we never have to fit arbitrary card names into the 64-byte callback_data
+ * limit. The list is read fresh each call so a just-learned method shows up immediately.
+ */
+function buildPaymentMethodKeyboard(token) {
+  const methods = getPaymentMethods();
+  const rows = [];
+  for (let i = 0; i < methods.length; i += 2) {
+    const row = [];
+    for (const idx of [i, i + 1]) {
+      if (idx >= methods.length) continue;
+      const data = `pm:${token}:${idx}`;
+      assertCallbackDataLength(data);
+      row.push({ text: methods[idx], callback_data: data });
+    }
+    rows.push(row);
+  }
+  return { inline_keyboard: rows };
+}
+
+/**
+ * Shown when a draft's paymentMethod is still PAYMENT_METHOD_UNCLEAR but paymentMethodRaw names
+ * something that doesn't match any known payment method (findKnownPaymentMethod returns null) —
+ * e.g. "PayMe" or "AliPay". Asks whether to save it permanently (addCustomPaymentMethod, which
+ * updates the OpenAI-facing list immediately) or fall back to picking from the known list.
+ */
+function buildNewPaymentMethodKeyboard(token, rawPaymentMethod) {
+  const yesData = `newpm:${token}:y`;
+  const noData = `newpm:${token}:n`;
+  assertCallbackDataLength(yesData);
+  assertCallbackDataLength(noData);
+  return {
+    inline_keyboard: [
+      [{ text: `✅ Yes, save "${rawPaymentMethod}"`.slice(0, 64), callback_data: yesData }],
+      [{ text: "❌ No, let me pick from the list", callback_data: noData }],
+    ],
+  };
+}
+
+/**
+ * Gates the normal Yes/Edit keyboard behind a resolved payment method. Three states:
+ *   1. paymentMethod already resolved -> buildConfirmKeyboard.
+ *   2. paymentMethod unclear but paymentMethodRaw names something genuinely new (not a known
+ *      method under any casing) -> buildNewPaymentMethodKeyboard, offering to learn it.
+ *   3. paymentMethod unclear and nothing new to learn (raw empty, or it already matches a known
+ *      method) -> buildPaymentMethodKeyboard, the plain picker.
+ */
+function keyboardForDraft(token, draft) {
+  if (draft.paymentMethod !== PAYMENT_METHOD_UNCLEAR) {
+    return buildConfirmKeyboard(token);
+  }
+  const raw = draft.paymentMethodRaw;
+  if (raw && !findKnownPaymentMethod(raw)) {
+    return buildNewPaymentMethodKeyboard(token, raw);
+  }
+  return buildPaymentMethodKeyboard(token);
+}
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -251,34 +415,64 @@ function formatDateDdMmYyyy(date) {
   return `${d}/${m}/${y}`;
 }
 
-const transactionJsonSchema = {
-  type: "object",
-  properties: {
-    amount: { type: "number" },
-    description: { type: "string" },
-    category: { type: "string" },
-    subcategory: { type: "string" },
-    type: { type: "string", enum: ["expense", "income"] },
-    location: { type: "string" },
-    currency: { type: "string" },
-    notes: { type: "string" },
-    paymentMethod: { type: "string" },
-    recipient: { type: "string" },
-  },
-  required: [
-    "amount",
-    "description",
-    "category",
-    "subcategory",
-    "type",
-    "location",
-    "currency",
-    "notes",
-    "paymentMethod",
-    "recipient",
-  ],
-  additionalProperties: false,
-};
+/**
+ * Built fresh on every OpenAI call (rather than a static const) so a payment method learned
+ * mid-session via addCustomPaymentMethod() is immediately available to the very next parse —
+ * no restart needed.
+ *
+ * paymentMethodRaw is intentionally NOT enum-constrained: it's how we detect an unfamiliar
+ * payment method. paymentMethod itself must still be one of the known values (or "Unclear");
+ * paymentMethodRaw carries the verbatim wording so the bot can offer to learn it.
+ */
+function buildTransactionJsonSchema() {
+  return {
+    type: "object",
+    properties: {
+      amount: { type: "number" },
+      description: { type: "string" },
+      category: { type: "string" },
+      subcategory: { type: "string" },
+      type: { type: "string", enum: ["expense", "income"] },
+      location: { type: "string" },
+      currency: { type: "string" },
+      notes: { type: "string" },
+      paymentMethod: { type: "string", enum: [...getPaymentMethods(), PAYMENT_METHOD_UNCLEAR] },
+      paymentMethodRaw: { type: "string" },
+      recipient: { type: "string" },
+      /** dd/mm/yyyy if an explicit or relative date is stated/legible, else null — never guessed. */
+      date: { type: ["string", "null"] },
+    },
+    required: [
+      "amount",
+      "description",
+      "category",
+      "subcategory",
+      "type",
+      "location",
+      "currency",
+      "notes",
+      "paymentMethod",
+      "paymentMethodRaw",
+      "recipient",
+      "date",
+    ],
+    additionalProperties: false,
+  };
+}
+
+/** Parses a strict dd/mm/yyyy (or dd-mm-yyyy / dd.mm.yyyy) string into a real, calendar-valid Date. Returns null if invalid/absent. */
+function parseDateDdMmYyyy(str) {
+  if (typeof str !== "string") return null;
+  const m = str.trim().match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+  if (!m) return null;
+  const day = Number(m[1]);
+  const month = Number(m[2]);
+  const year = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const d = new Date(year, month - 1, day);
+  if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) return null;
+  return d;
+}
 
 function buildAnalysisPrompt(messageText, contextDateLabel) {
   const categoryList = allowedCategories.join(", ");
@@ -295,8 +489,10 @@ function buildAnalysisPrompt(messageText, contextDateLabel) {
     `- location: default "${DEFAULT_LOCATION}" unless the message states another place.`,
     `- currency: default "${DEFAULT_CURRENCY}" unless the message states another currency.`,
     `- notes: empty string unless the user explicitly adds an extra note beyond amount/description; do not duplicate the description.`,
-    `- paymentMethod: if the message names how it was paid (e.g. cash, a specific card, or bank), be as precise as the message allows (e.g. "BOC Visa", "HSBC transfer", "Cash"). If nothing is mentioned, use "Unknown". Never invent a payment method.`,
+    `- paymentMethod: MUST be exactly one of these strings — no other value is valid: ${getPaymentMethods().map((m) => `"${m}"`).join(", ")}. Match the message to the closest of these (e.g. "BOC Visa" or "the Visa" → "Visa BOC"; "bank" or "transfer" → "Bank Transfer"; "cash" → "Cash"; "octopus" → "Octopus"; "wechat" or "wechat pay" → "WeChat Pay"). If the message does not indicate how it was paid clearly enough to pick one of these with confidence, use "${PAYMENT_METHOD_UNCLEAR}" — never guess a specific card, and never invent a value outside this list.`,
+    `- paymentMethodRaw: the exact word(s) the message used for how it was paid, verbatim (e.g. "PayMe", "Alipay", "octopus card"), even if you couldn't map it to one of the fixed paymentMethod options above. Empty string if the message says nothing at all about how it was paid. This is used to detect a payment method the user hasn't saved yet — never invent something the message doesn't actually say.`,
     `- recipient: empty string unless the message names a specific person the payment was made to or received from (e.g. a staff member, family member, or vendor contact) — e.g. "Получатель: Yaya" or "for Maria". Never invent a name.`,
+    `- date: if the message states an explicit or relative date for the transaction (e.g. "yesterday", "on 15/03", "last Friday"), resolve it relative to the context date above and output as dd/mm/yyyy. If no date is stated, output null — never guess or default to today; the caller falls back to the message's own timestamp.`,
     "",
     `User message:\n${messageText}`,
   ].join("\n");
@@ -306,7 +502,8 @@ function buildEditPrompt(currentDraft, editInstruction, originalMessage) {
   const categoryList = allowedCategories.join(", ");
   return [
     "Apply the user's edit instructions to this draft. Keep other fields unchanged unless the edit implies them.",
-    "This includes paymentMethod: keep its current value unless the edit instruction explicitly changes the payment method.",
+    `This includes paymentMethod: keep its current value unless the edit instruction explicitly changes the payment method. paymentMethod MUST be exactly one of these strings — no other value is valid: ${getPaymentMethods().map((m) => `"${m}"`).join(", ")}. If the edit instruction requests a payment method that doesn't clearly match one of these, use "${PAYMENT_METHOD_UNCLEAR}" instead of inventing a new value.`,
+    "This also includes date (currently dd/mm/yyyy in the draft): keep it unchanged unless the edit instruction explicitly gives a new date, e.g. \"date to 15/03/2026\", \"change date to yesterday\", \"it was actually last Friday\" — resolve relative dates the same way. Always output date as dd/mm/yyyy, never null, when editing an existing draft.",
     `Allowed categories: ${categoryList}. Never use "${RAW_SHEET}" as category name.`,
     "",
     "Current draft (JSON):",
@@ -371,7 +568,7 @@ async function parseTransactionWithOpenAI(messageText, messageDate) {
       format: {
         type: "json_schema",
         name: "transaction",
-        schema: transactionJsonSchema,
+        schema: buildTransactionJsonSchema(),
       },
     },
   });
@@ -403,8 +600,10 @@ function buildImageAnalysisPrompt(captionText, contextDateLabel) {
     `- location: default "${DEFAULT_LOCATION}" unless the image or caption states another place.`,
     `- currency: default "${DEFAULT_CURRENCY}" unless the image clearly shows another currency symbol or code.`,
     "- notes: empty string unless there is a clear extra detail worth keeping (e.g. last 4 card digits, transaction id); do not duplicate the description.",
-    "- paymentMethod: read this as precisely as the image allows—bank name plus card type/tier if shown (e.g. \"BOC VISA Infinite\", \"DBS Mastercard\"), or \"Cash\" for cash receipts. If a card is shown but the bank/type isn't legible, use \"Card (unspecified)\". If there is no payment method visible at all, use \"Unknown\". Never invent a bank or card name that isn't actually visible.",
+    `- paymentMethod: MUST be exactly one of these strings — no other value is valid: ${getPaymentMethods().map((m) => `"${m}"`).join(", ")}. Match what's visible in the image to the closest of these (e.g. a BOC-branded Visa card → "Visa BOC"; a cash receipt → "Cash"; a bank transfer confirmation → "Bank Transfer"; an Octopus card/app screen → "Octopus"; a WeChat Pay screen → "WeChat Pay"). If a card or payment app is shown but you can't confidently match it to one of these, or if no payment method is visible at all, use "${PAYMENT_METHOD_UNCLEAR}" — never guess a specific card, and never invent a value outside this list.`,
+    `- paymentMethodRaw: the exact text or branding visible for how it was paid, verbatim (e.g. "PayMe", "Alipay", card issuer name printed on a receipt), even if you couldn't map it to one of the fixed paymentMethod options above. Empty string if nothing about payment method is visible. This is used to detect a payment method the user hasn't saved yet — never invent something not actually visible.`,
     "- recipient: empty string unless the image or caption names a specific person the payment was made to or received from (e.g. a staff member, family member, or vendor contact). Never invent a name.",
+    "- date: read the transaction date printed on the receipt or screenshot if it is legible (e.g. a printed receipt date, or an iPhone Wallet payment timestamp), and output it as dd/mm/yyyy. Receipts are very often not from today. If no date is visible anywhere in the image, output null — never guess or default to today.",
   ].join("\n");
 }
 
@@ -429,7 +628,7 @@ async function parseTransactionFromImage(base64Image, mimeType, captionText, mes
       format: {
         type: "json_schema",
         name: "transaction",
-        schema: transactionJsonSchema,
+        schema: buildTransactionJsonSchema(),
       },
     },
   });
@@ -456,7 +655,7 @@ async function parseEditWithOpenAI(currentDraft, editInstruction, originalMessag
       format: {
         type: "json_schema",
         name: "transaction_edit",
-        schema: transactionJsonSchema,
+        schema: buildTransactionJsonSchema(),
       },
     },
   });
@@ -467,6 +666,9 @@ async function parseEditWithOpenAI(currentDraft, editInstruction, originalMessag
 
 function normalizeDraft(result, messageDate) {
   const md = messageDate instanceof Date ? messageDate : new Date();
+  /** Prefer a date read off the receipt/message or set via an edit; fall back to the Telegram message timestamp. */
+  const extractedDate = parseDateDdMmYyyy(result.date);
+  const effectiveDate = extractedDate || md;
   const normalized = {
     amount: Number(result.amount),
     description: String(result.description || "").trim(),
@@ -476,10 +678,12 @@ function normalizeDraft(result, messageDate) {
     location: String(result.location || "").trim() || DEFAULT_LOCATION,
     currency: String(result.currency || "").trim() || DEFAULT_CURRENCY,
     notes: String(result.notes || "").trim(),
-    paymentMethod: String(result.paymentMethod || "").trim() || "Unknown",
+    paymentMethod: String(result.paymentMethod || "").trim() || PAYMENT_METHOD_UNCLEAR,
+    /** Verbatim payment-method wording from the message/receipt, even when unmapped to a known enum value — used to detect and offer to learn a new payment method. */
+    paymentMethodRaw: String(result.paymentMethodRaw || "").trim(),
     recipient: String(result.recipient || "").trim(),
-    /** dd/mm/yyyy for RAW sheet (from message time) */
-    dateDdMmYyyy: formatDateDdMmYyyy(md),
+    /** dd/mm/yyyy — from the receipt/message/edit when present, else the Telegram message time. */
+    dateDdMmYyyy: formatDateDdMmYyyy(effectiveDate),
   };
 
   if (!Number.isFinite(normalized.amount) || normalized.amount <= 0) {
@@ -533,8 +737,14 @@ function formatDraftPreview(draft, categorySheetName) {
     `Location: ${draft.location}`,
     `Sum: ${draft.amount}`,
     `Currency: ${draft.currency}`,
-    "Sum (HKD): (leave blank — calculated in sheet)",
-    `Payment method: ${draft.paymentMethod || "Unknown"}`,
+    "Sum (HKD): (calculated automatically from that day's exchange rate)",
+    `Payment method: ${
+      draft.paymentMethod === PAYMENT_METHOD_UNCLEAR || !draft.paymentMethod
+        ? draft.paymentMethodRaw && !findKnownPaymentMethod(draft.paymentMethodRaw)
+          ? `⚠️ New payment method detected: "${draft.paymentMethodRaw}" — save it? (see buttons below)`
+          : "⚠️ Not yet chosen — please pick below"
+        : draft.paymentMethod
+    }`,
     `Recipient: ${draft.recipient && draft.recipient.length ? draft.recipient : "—"}`,
     `Logged by: ${draft.sender || "Unknown"}`,
     notesLine,
@@ -543,7 +753,7 @@ function formatDraftPreview(draft, categorySheetName) {
   ].join("\n");
 }
 
-function buildRawRowValues(draft, categorySheetName) {
+function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
   const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
 
   return [
@@ -555,30 +765,37 @@ function buildRawRowValues(draft, categorySheetName) {
     draft.location,
     draft.amount,
     draft.currency,
-    "",
+    sumHkd,
     notesCell,
     draft.sender || "Unknown",
-    draft.paymentMethod || "Unknown",
+    draft.paymentMethod || PAYMENT_METHOD_UNCLEAR,
+    rowId || "",
+    syncHash || "",
   ];
 }
 
 /**
- * Column order for every expense category Excel Table (12 columns) as of 2026-08-19:
- * Дата, Категория, Описание, Локация, Сумма, Валюта, Курс, Сумма (HKD), Примечание,
- * Метод оплаты, Получатель/Сотрудник, Пользователь.
+ * Column order for every expense category Excel Table (14 columns as of the RowID/SyncHash
+ * migration): Дата, Категория, Описание, Локация, Сумма, Валюта, Курс, Сумма (HKD), Примечание,
+ * Метод оплаты, Получатель/Сотрудник, Пользователь, RowID, SyncHash.
  *
  * Mariya removed the 5 unused insurance columns (Страховка, Статус выплаты, Страховая
  * компания, Период покрытия, Карта) from every expense category table on 2026-08-19,
  * shrinking each table from 17 to 12 columns. The bot's old fixed 17-value write then
  * failed with Graph's InvalidArgument "number of rows or columns doesn't match". Пользователь
- * is now the last column instead of being sandwiched among the insurance fields — do not
- * reorder it back without re-confirming the live table layout.
+ * is now the last visible column instead of being sandwiched among the insurance fields — do
+ * not reorder it back without re-confirming the live table layout. RowID/SyncHash were then
+ * appended as two new technical columns (12, 13) — see scripts/migrate-workbook.js and
+ * syncJob.js's CAT_COLS. Both must be present on every row for the sync job to match/diff it;
+ * run the migration script before deploying this code.
  *
  * Категория here is RAW's Subcategory (precision line item), not RAW's Category — confirmed
- * with Mariya. Курс and Сумма (HKD) are Excel formulas (exchange rate lookup) and must never
- * be written by the bot.
+ * with Mariya. Курс and Сумма (HKD) used to be live Excel formulas (VLOOKUP against the single
+ * current-rate CurrencyRates table). As of this change they are bot-computed static numbers
+ * frozen to the transaction's own date, so a later rate update never retroactively changes a
+ * past expense. See fxRates.js.
  */
-function buildCategoryRowValues(draft) {
+function buildCategoryRowValues(draft, rate, sumHkd, rowId, syncHash) {
   const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
 
   return [
@@ -588,13 +805,57 @@ function buildCategoryRowValues(draft) {
     draft.location, // Локация
     draft.amount, // Сумма
     draft.currency, // Валюта
-    "", // Курс — Excel formula, never written here
-    "", // Сумма (HKD) — Excel formula, never written here
+    rate, // Курс — frozen to this transaction's date, bot-computed
+    sumHkd, // Сумма (HKD) — frozen, bot-computed
     notesCell, // Примечание
-    draft.paymentMethod || "Unknown", // Метод оплаты
+    draft.paymentMethod || PAYMENT_METHOD_UNCLEAR, // Метод оплаты
     draft.recipient || "", // Получатель/Сотрудник
     draft.sender || "Unknown", // Пользователь
+    rowId || "", // RowID — shared with the matching RAW row, written once at creation
+    syncHash || "", // SyncHash — fingerprint of the mergeable fields, see syncJob.js
   ];
+}
+
+function roundMoney(n) {
+  return Math.round(n * 100) / 100;
+}
+
+/** Appends one row to the (optional) FX audit-log table. Best-effort — never blocks an expense write. */
+async function recordRateHistory({ currency, date, rate }) {
+  try {
+    const driveId = getExcelDriveIdFromEnv();
+    const itemId = getExcelItemIdFromEnv();
+    const source = currency === "RUB" ? "CBR (cbr.ru)" : "Frankfurter (ECB)";
+    await appendTableRow(driveId, itemId, EXCHANGE_RATE_HISTORY_TABLE, [
+      date,
+      currency,
+      rate,
+      source,
+      new Date().toISOString(),
+    ]);
+  } catch (err) {
+    console.error(
+      `Could not write to "${EXCHANGE_RATE_HISTORY_TABLE}" (run scripts/migrate-workbook.js if it doesn't exist yet):`,
+      err.message
+    );
+  }
+}
+
+/**
+ * Looks up (and caches) the historical rate for this transaction's currency+date and freezes
+ * it into a static number. Never throws — if every FX source fails (network down, unsupported
+ * currency, etc.) it falls back to blank cells so the expense still logs; the failure is
+ * surfaced via `ok: false` so the Telegram success message can warn that the rate needs a
+ * manual fill-in.
+ */
+async function computeFrozenHkdConversion(draft) {
+  try {
+    const rate = await fxRates.getRateToHkd(draft.currency, draft.dateDdMmYyyy, recordRateHistory);
+    return { rate, sumHkd: roundMoney(draft.amount * rate), ok: true };
+  } catch (err) {
+    console.error(`FX lookup failed for ${draft.currency} ${draft.dateDdMmYyyy}:`, err.message);
+    return { rate: "", sumHkd: "", ok: false, error: err.message };
+  }
 }
 
 /**
@@ -602,16 +863,39 @@ function buildCategoryRowValues(draft) {
  * (income has no dedicated table — RAW is the sole record). These are two independent
  * Graph API calls: if RAW succeeds but the category write fails, the thrown error is tagged
  * with rawSucceeded=true so the caller never retries (which would duplicate the RAW row).
+ *
+ * Every newly-created expense also gets a fresh RowID (shared by both the RAW and category
+ * copies) and a SyncHash fingerprint of the fields that are supposed to mirror between them —
+ * see syncJob.js. Both sides are written from the exact same draft in the same request, so
+ * their fields necessarily agree right now; computing one hash and reusing it for both rows
+ * means the very first sync pass sees them as already in sync (no spurious propagation).
+ * Income rows get a RowID too (harmless, just never matched against anything, since income
+ * has no category table) so every RAW row has a consistent shape.
  */
 async function appendTransactionToExcel(draft) {
   const driveId = getExcelDriveIdFromEnv();
   const itemId = getExcelItemIdFromEnv();
-  const rawRow = buildRawRowValues(draft, draft.category);
+
+  const fx = await computeFrozenHkdConversion(draft);
+
+  const rowId = crypto.randomBytes(8).toString("hex");
+  const syncHash = computeSyncHash({
+    date: draft.dateDdMmYyyy,
+    description: draft.description,
+    location: draft.location,
+    amount: Number(draft.amount),
+    currency: String(draft.currency || "").trim().toUpperCase(),
+    notes: draft.notes && draft.notes.length ? draft.notes : "",
+    paymentMethod: draft.paymentMethod || PAYMENT_METHOD_UNCLEAR,
+    subcategory: draft.subcategory,
+  });
+
+  const rawRow = buildRawRowValues(draft, draft.category, fx.sumHkd, rowId, syncHash);
 
   await appendTableRow(driveId, itemId, RAW_SHEET, rawRow);
 
   if (draft.type !== "expense") {
-    return;
+    return fx;
   }
 
   const tableName = CATEGORY_TABLE_MAP[draft.category];
@@ -624,12 +908,14 @@ async function appendTransactionToExcel(draft) {
   }
 
   try {
-    const categoryRow = buildCategoryRowValues(draft);
+    const categoryRow = buildCategoryRowValues(draft, fx.rate, fx.sumHkd, rowId, syncHash);
     await appendTableRow(driveId, itemId, tableName, categoryRow);
   } catch (err) {
     err.rawSucceeded = true;
     throw err;
   }
+
+  return fx;
 }
 
 function isStartCommand(text) {
@@ -651,6 +937,8 @@ function getWelcomeMessage() {
     "I'll analyze the amount and description, show a preview (category + RAW columns), and wait for you to tap Yes, log it or Edit before anything is saved. ✅",
     "",
     "If you're editing and change your mind, send /cancel.",
+    "",
+    "RAW and the category tabs sync automatically every day. If you edited a row directly in Excel and want it reflected right away, send /sync.",
   ].join("\n");
 }
 
@@ -745,6 +1033,13 @@ async function bootstrap() {
   categoryAliasMap = parseCategoryMappingEnv();
   allowedCategories = [...Object.keys(CATEGORY_TABLE_MAP), INCOME_SHEET];
 
+  loadCustomPaymentMethods();
+  console.log(
+    `Payment methods: ${getPaymentMethods().length} known (${BASE_PAYMENT_METHODS.length} base + ${customPaymentMethods.length} learned)${
+      customPaymentMethods.length ? ` — learned: ${customPaymentMethods.join(", ")}` : ""
+    }.`
+  );
+
   console.log(
     `Budget logger: ${allowedCategories.length} categories — ${allowedCategories.join(", ")}`
   );
@@ -774,6 +1069,76 @@ function isCancelCommand(text) {
   return t === "/cancel" || t.startsWith("/cancel ");
 }
 
+function isSyncCommand(text) {
+  const t = (text || "").trim();
+  return t === "/sync" || t.startsWith("/sync ");
+}
+
+/**
+ * Runs both daily maintenance jobs (CurrencyRates refresh, RAW<->category sync) back to
+ * back and returns a combined human-readable report. Shared by the daily scheduler and the
+ * on-demand `/sync` Telegram command — `/sync` always includes both, since a stale
+ * CurrencyRates table would otherwise silently persist until the next scheduled run.
+ */
+async function runDailyMaintenanceJobs() {
+  const driveId = getExcelDriveIdFromEnv();
+  const itemId = getExcelItemIdFromEnv();
+
+  const currencyRates = await refreshCurrencyRatesTable({
+    driveId,
+    itemId,
+    tableName: CURRENCY_RATES_TABLE_NAME,
+  });
+
+  const sync = await runSync({
+    driveId,
+    itemId,
+    rawSheetName: RAW_SHEET,
+    categoryTableMap: CATEGORY_TABLE_MAP,
+  });
+
+  const report = [formatDailyJobsReport({ currencyRates }), "", formatSyncReport(sync)].join("\n");
+  return { currencyRates, sync, report };
+}
+
+let lastDailyJobsRunUtcDate = null;
+
+/** Runs the daily jobs immediately and records today's UTC date so the hourly checker below doesn't re-run them again today. */
+async function runDailyMaintenanceJobsNow(reason) {
+  lastDailyJobsRunUtcDate = new Date().toISOString().slice(0, 10);
+  try {
+    console.log(`Running daily maintenance jobs (${reason})...`);
+    const { report } = await runDailyMaintenanceJobs();
+    console.log(`Daily maintenance jobs (${reason}) done:\n${report}`);
+    if (REPORT_CHAT_ID) {
+      try {
+        await sendTelegramMessage(REPORT_CHAT_ID, `🗓️ Daily maintenance (${reason}):\n\n${report}`);
+      } catch (err) {
+        console.error("Failed to send daily maintenance report to Telegram:", err.message);
+      }
+    }
+  } catch (err) {
+    console.error(`Daily maintenance jobs (${reason}) failed:`, err.stack || err.message);
+  }
+}
+
+/**
+ * No native scheduler dependency (avoids adding node-cron): an hourly interval just checks
+ * whether the UTC calendar date has changed since the last run, and if so runs once. Checked
+ * hourly rather than e.g. daily-at-midnight so a Railway restart near midnight can't cause the
+ * day to be skipped entirely.
+ */
+function scheduleDailyMaintenanceJobs() {
+  setInterval(() => {
+    const todayUtc = new Date().toISOString().slice(0, 10);
+    if (todayUtc !== lastDailyJobsRunUtcDate) {
+      runDailyMaintenanceJobsNow("daily schedule").catch((err) =>
+        console.error("scheduleDailyMaintenanceJobs:", err.stack || err.message)
+      );
+    }
+  }, 60 * 60 * 1000);
+}
+
 async function presentDraftForConfirmation(parsed, context) {
   const { chatId, originalMessage, sender, messageId, messageDate, messageThreadId } = context;
   const draft = normalizeDraft(parsed, messageDate);
@@ -795,7 +1160,7 @@ async function presentDraftForConfirmation(parsed, context) {
 
   const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
   const preview = formatDraftPreview(draft, categorySheetName);
-  const keyboard = buildConfirmKeyboard(token);
+  const keyboard = keyboardForDraft(token, draft);
 
   await sendTelegramMessage(chatId, preview, messageId, keyboard, threadExtras);
 }
@@ -879,6 +1244,7 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
     notes: entry.draft.notes,
     paymentMethod: entry.draft.paymentMethod,
     recipient: entry.draft.recipient,
+    date: entry.draft.dateDdMmYyyy,
   };
 
   try {
@@ -903,7 +1269,7 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
     awaitingEditByChat.delete(chatId);
 
     const preview = formatDraftPreview(draft, categorySheetName);
-    const keyboard = buildConfirmKeyboard(newToken);
+    const keyboard = keyboardForDraft(newToken, draft);
 
     await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard, threadExtras);
   } catch (err) {
@@ -960,7 +1326,16 @@ async function handleCallbackQuery(callbackQuery) {
     const entry = pendingByToken.get(token);
     if (!entry) {
       if (inflightLogTokens.has(token)) {
-        await tell("⏳ Still saving that expense — watch for an update in this chat.");
+        /** A duplicate/racing redelivery of the same tap — Telegram can resend a callback_query
+         * if our ack was slow. Wait for the write that's already in progress and report its real
+         * outcome instead of a static "still saving" message, which could otherwise land in the
+         * chat after the "✅ Logged successfully" message once the original finishes. */
+        const result = await (inflightLogPromises.get(token) || Promise.resolve({ ok: true }));
+        await tell(
+          result.ok
+            ? "✅ Already logged, no action needed."
+            : `❌ Log failed — nothing was saved.\n${result.detail || ""}`.trim()
+        );
         return;
       }
       await tell(
@@ -984,49 +1359,57 @@ async function handleCallbackQuery(callbackQuery) {
         ? { message_thread_id: entry.messageThreadId }
         : callbackExtras;
 
-    try {
-      await appendTransactionToExcel(entry.draft);
-      completedLogByToken.set(token, Date.now());
-
-      const cat = entry.draft.category;
-      const dLabel = entry.draft.dateDdMmYyyy;
-      const tableNote = entry.draft.type === "expense" ? ` and "${cat}"` : "";
-      const successText =
-        `✅ Logged successfully.\n` +
-        `Saved to "${RAW_SHEET}"${tableNote}.\n` +
-        `${entry.draft.amount} ${entry.draft.currency} · ${dLabel}`;
-
+    const logPromise = (async () => {
       try {
-        await editTelegramMessage(chatId, messageId, successText, { inline_keyboard: [] }, entryThreadExtras);
-      } catch {
-        await sendTelegramMessage(
-          chatId,
-          successText,
-          null,
-          undefined,
-          entryThreadExtras
-        );
-      }
-      awaitingEditByChat.delete(chatId);
-    } catch (err) {
-      console.error("Log callback error:", err.message);
-
-      const failDetail = (err.message || "Unknown error").slice(0, 400);
-      if (err.rawSucceeded) {
-        /** RAW already has this row — do NOT restore to pendingByToken, a retry would duplicate it. */
+        const fx = await appendTransactionToExcel(entry.draft);
         completedLogByToken.set(token, Date.now());
+
+        const cat = entry.draft.category;
+        const dLabel = entry.draft.dateDdMmYyyy;
+        const tableNote = entry.draft.type === "expense" ? ` and "${cat}"` : "";
+        const fxWarning =
+          fx && fx.ok === false
+            ? `\n⚠️ Exchange rate lookup failed — Курс/Sum (HKD) left blank, please fill in manually.`
+            : "";
+        const successText =
+          `✅ Logged successfully.\n` +
+          `Saved to "${RAW_SHEET}"${tableNote}.\n` +
+          `${entry.draft.amount} ${entry.draft.currency} · ${dLabel}${fxWarning}`;
+
         try {
+          await editTelegramMessage(chatId, messageId, successText, { inline_keyboard: [] }, entryThreadExtras);
+        } catch {
           await sendTelegramMessage(
             chatId,
-            `⚠️ Logged to "${RAW_SHEET}" but the "${entry.draft.category}" table write failed — check the workbook.\n${failDetail}`,
+            successText,
             null,
             undefined,
             entryThreadExtras
           );
-        } catch (notifyError) {
-          console.error("Failed to send Telegram error:", notifyError.message);
         }
-      } else {
+        awaitingEditByChat.delete(chatId);
+        return { ok: true };
+      } catch (err) {
+        console.error("Log callback error:", err.message);
+
+        const failDetail = (err.message || "Unknown error").slice(0, 400);
+        if (err.rawSucceeded) {
+          /** RAW already has this row — do NOT restore to pendingByToken, a retry would duplicate it. */
+          completedLogByToken.set(token, Date.now());
+          try {
+            await sendTelegramMessage(
+              chatId,
+              `⚠️ Logged to "${RAW_SHEET}" but the "${entry.draft.category}" table write failed — check the workbook.\n${failDetail}`,
+              null,
+              undefined,
+              entryThreadExtras
+            );
+          } catch (notifyError) {
+            console.error("Failed to send Telegram error:", notifyError.message);
+          }
+          return { ok: true, detail: failDetail };
+        }
+
         pendingByToken.set(token, entry);
         try {
           await sendTelegramMessage(
@@ -1039,10 +1422,15 @@ async function handleCallbackQuery(callbackQuery) {
         } catch (notifyError) {
           console.error("Failed to send Telegram error:", notifyError.message);
         }
+        return { ok: false, detail: failDetail };
+      } finally {
+        inflightLogTokens.delete(token);
+        inflightLogPromises.delete(token);
       }
-    } finally {
-      inflightLogTokens.delete(token);
-    }
+    })();
+
+    inflightLogPromises.set(token, logPromise);
+    await logPromise;
     return;
   }
 
@@ -1074,6 +1462,96 @@ async function handleCallbackQuery(callbackQuery) {
       undefined,
       editThreadExtras
     );
+    return;
+  }
+
+  const pmPrefix = "pm:";
+  if (data.startsWith(pmPrefix)) {
+    const rest = data.slice(pmPrefix.length);
+    const sepIdx = rest.lastIndexOf(":");
+    const token = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const idx = sepIdx === -1 ? NaN : Number(rest.slice(sepIdx + 1));
+
+    prunePending();
+    const entry = pendingByToken.get(token);
+    if (!entry) {
+      await tell(
+        "⚠️ This confirmation is not on this server anymore. Send the expense again. With multiple replicas, use only one instance."
+      );
+      return;
+    }
+    if (entry.chatId !== chatId) {
+      await tell("Not allowed.");
+      return;
+    }
+    const pmMethods = getPaymentMethods();
+    if (!Number.isInteger(idx) || idx < 0 || idx >= pmMethods.length) {
+      await tell("⚠️ Unrecognized payment method option — send the expense again.");
+      return;
+    }
+
+    entry.draft.paymentMethod = pmMethods[idx];
+
+    const pmThreadExtras =
+      entry.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : callbackExtras;
+    const preview = formatDraftPreview(entry.draft, entry.draft.category);
+    const keyboard = buildConfirmKeyboard(token);
+
+    try {
+      await editTelegramMessage(chatId, messageId, preview, keyboard, pmThreadExtras);
+    } catch (e) {
+      console.error("editTelegramMessage (pm select):", e.message);
+      await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard, pmThreadExtras);
+    }
+    return;
+  }
+
+  const newpmPrefix = "newpm:";
+  if (data.startsWith(newpmPrefix)) {
+    const rest = data.slice(newpmPrefix.length);
+    const sepIdx = rest.lastIndexOf(":");
+    const token = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const choice = sepIdx === -1 ? "" : rest.slice(sepIdx + 1);
+
+    prunePending();
+    const entry = pendingByToken.get(token);
+    if (!entry) {
+      await tell(
+        "⚠️ This confirmation is not on this server anymore. Send the expense again. With multiple replicas, use only one instance."
+      );
+      return;
+    }
+    if (entry.chatId !== chatId) {
+      await tell("Not allowed.");
+      return;
+    }
+
+    if (choice === "y") {
+      // Learn it: persists to data/customPaymentMethods.json and is picked up by
+      // getPaymentMethods() immediately, so the very next OpenAI parse call already knows it.
+      const saved = addCustomPaymentMethod(entry.draft.paymentMethodRaw);
+      entry.draft.paymentMethod = saved || entry.draft.paymentMethodRaw;
+    } else {
+      // Declined: clear paymentMethodRaw so keyboardForDraft falls through to the plain picker
+      // instead of re-showing this same "new method?" prompt in a loop.
+      entry.draft.paymentMethodRaw = "";
+    }
+
+    const newpmThreadExtras =
+      entry.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : callbackExtras;
+    const preview = formatDraftPreview(entry.draft, entry.draft.category);
+    const keyboard = keyboardForDraft(token, entry.draft);
+
+    try {
+      await editTelegramMessage(chatId, messageId, preview, keyboard, newpmThreadExtras);
+    } catch (e) {
+      console.error("editTelegramMessage (newpm select):", e.message);
+      await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard, newpmThreadExtras);
+    }
     return;
   }
 
@@ -1154,6 +1632,26 @@ app.post("/webhook/telegram", async (req, res) => {
       return ok();
     }
 
+    if (isSyncCommand(originalMessage)) {
+      res.status(200).json({ ok: true });
+      (async () => {
+        try {
+          await sendTelegramMessage(chatId, "⏳ Running sync (CurrencyRates + RAW ↔ category tables)...", messageId, undefined, threadExtras);
+          const { report } = await runDailyMaintenanceJobs();
+          lastDailyJobsRunUtcDate = new Date().toISOString().slice(0, 10);
+          await sendTelegramMessage(chatId, `✅ Sync done.\n\n${report}`, messageId, undefined, threadExtras);
+        } catch (err) {
+          console.error("/sync failed:", err.stack || err.message);
+          try {
+            await sendTelegramMessage(chatId, `❌ Sync failed: ${err.message}`, messageId, undefined, threadExtras);
+          } catch (notifyErr) {
+            console.error("Failed to send /sync failure message:", notifyErr.message);
+          }
+        }
+      })();
+      return;
+    }
+
     try {
       if (imageInput) {
         /** A photo always starts a fresh draft; it is never treated as a reply to a pending edit. */
@@ -1222,6 +1720,10 @@ bootstrap()
     app.listen(PORT, async () => {
       console.log(`Budget logger is running on port ${PORT}`);
       await ensureTelegramWebhook();
+      runDailyMaintenanceJobsNow("startup").catch((err) =>
+        console.error("Startup daily maintenance run failed:", err.stack || err.message)
+      );
+      scheduleDailyMaintenanceJobs();
     });
   })
   .catch((err) => {
