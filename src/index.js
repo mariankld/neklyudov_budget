@@ -49,6 +49,16 @@ const CATEGORY_TABLE_MAP = {
 };
 
 /**
+ * Categories the bot must never log to itself. Credit Cards was removed 2026-08-20: a live
+ * header check (node scripts/migrate-workbook.js) confirmed CreditCards is currently a 17-column
+ * table with the exact same shape as Health/MedInsurance, so it now shares that write branch
+ * (see INSURANCE_CATEGORY_TABLES below) instead of the generic 14-column one — no risk of
+ * landing data in the wrong columns. Once RowID/SyncHash are added (migrate-workbook.js --apply),
+ * it's a normal pickable category like any other; the sync job also now scans it.
+ */
+const MANUAL_ONLY_CATEGORIES = [];
+
+/**
  * Enumerated set of Payment Method values. Everything written to the workbook must be exactly
  * one of these strings — no free text — so Summary tab SUMIF/SUMIFS formulas that match on
  * Payment Method (e.g. "*Visa BOC*") never silently miss a row because of a syntax variant like
@@ -65,6 +75,15 @@ const CREDIT_CARD_PAYMENT_METHODS = ["Master SC", "Visa BOC", "Master BEA", "Mas
 const OTHER_PAYMENT_METHODS = ["Cash", "Bank Transfer", "Octopus", "WeChat Pay"];
 const BASE_PAYMENT_METHODS = [...CREDIT_CARD_PAYMENT_METHODS, ...OTHER_PAYMENT_METHODS];
 const PAYMENT_METHOD_UNCLEAR = "Unclear";
+/**
+ * Written into Payment Method when the user declines to permanently save a genuinely-new method
+ * string (the `newpm:...:n` button) — per Mariya (2026-08-20), declining must NOT discard the
+ * expense or force a pick from the fixed list; the transaction still logs, just labeled as an
+ * unfamiliar payment method so it's easy to find and fix by hand later. Distinct from
+ * PAYMENT_METHOD_UNCLEAR (which still gates the draft behind a picker) — this value resolves
+ * keyboardForDraft straight to buildConfirmKeyboard.
+ */
+const PAYMENT_METHOD_UNFAMILIAR = "Unfamiliar Payment Method";
 
 /**
  * Learned payment methods (e.g. "PayMe", "AliPay") the user has confirmed via the Telegram
@@ -328,7 +347,8 @@ function buildPaymentMethodKeyboard(token) {
  * Shown when a draft's paymentMethod is still PAYMENT_METHOD_UNCLEAR but paymentMethodRaw names
  * something that doesn't match any known payment method (findKnownPaymentMethod returns null) —
  * e.g. "PayMe" or "AliPay". Asks whether to save it permanently (addCustomPaymentMethod, which
- * updates the OpenAI-facing list immediately) or fall back to picking from the known list.
+ * updates the OpenAI-facing list immediately) or, on decline, log the expense anyway with
+ * Payment Method set to PAYMENT_METHOD_UNFAMILIAR (see that constant — never discards the draft).
  */
 function buildNewPaymentMethodKeyboard(token, rawPaymentMethod) {
   const yesData = `newpm:${token}:y`;
@@ -338,7 +358,7 @@ function buildNewPaymentMethodKeyboard(token, rawPaymentMethod) {
   return {
     inline_keyboard: [
       [{ text: `✅ Yes, save "${rawPaymentMethod}"`.slice(0, 64), callback_data: yesData }],
-      [{ text: "❌ No, let me pick from the list", callback_data: noData }],
+      [{ text: `❌ No, log as "${PAYMENT_METHOD_UNFAMILIAR}"`.slice(0, 64), callback_data: noData }],
     ],
   };
 }
@@ -786,8 +806,9 @@ function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
  * is now the last visible column instead of being sandwiched among the insurance fields — do
  * not reorder it back without re-confirming the live table layout. RowID/SyncHash were then
  * appended as two new technical columns (12, 13) — see scripts/migrate-workbook.js and
- * syncJob.js's CAT_COLS. Both must be present on every row for the sync job to match/diff it;
- * run the migration script before deploying this code.
+ * syncJob.js's STANDARD_CAT_COLS (this table's shape) / catColsFor() (per-table dispatch).
+ * Both must be present on every row for the sync job to match/diff it; run the migration
+ * script before deploying this code.
  *
  * Категория here is RAW's Subcategory (precision line item), not RAW's Category — confirmed
  * with Mariya. Курс and Сумма (HKD) used to be live Excel formulas (VLOOKUP against the single
@@ -795,8 +816,59 @@ function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
  * frozen to the transaction's own date, so a later rate update never retroactively changes a
  * past expense. See fxRates.js.
  */
-function buildCategoryRowValues(draft, rate, sumHkd, rowId, syncHash) {
+/**
+ * Health and MedInsurance (Insurance category) were NOT part of the 2026-08-19 insurance-column
+ * removal — Mariya confirmed (2026-08-20) they must keep all 5 insurance columns (Страховка,
+ * Статус выплаты, Страховая компания, Период покрытия, Карта), unlike every other category
+ * table. The bot doesn't collect insurance-specific data via Telegram, so those 5 cells are
+ * always written blank; RowID/SyncHash are still appended at the end so the sync job can match
+ * these rows too. Keyed by Excel Table name (not category label) since that's what's passed in.
+ * Keep in sync with scripts/migrate-workbook.js's INSURANCE_TABLES and syncJob.js's per-table
+ * column maps — all three must agree on which tables keep the insurance columns.
+ *
+ * CreditCards added 2026-08-20: `node scripts/migrate-workbook.js` (dry run) confirmed the live
+ * CreditCards table is currently sitting at the exact same 17-column layout as Health/
+ * MedInsurance (Дата, Категория, Описание, Локация, Сумма, Валюта, Курс, Сумма (HKD),
+ * Примечание, Метод оплаты, Получатель/Сотрудник, Страховка, Статус выплаты, Пользователь,
+ * Страховая компания, Период покрытия, Карта) — it never got the 2026-08-19 cleanup either.
+ * Nothing to do with insurance, it just happens to match column-for-column, so it reuses this
+ * same branch/write shape. Summary!H21 filters CreditCards[Категория] (= Subcategory here, same
+ * as everywhere else) for "*Выплата*" — log credit card debt repayments with subcategory
+ * "Выплата" so that formula keeps picking them up.
+ */
+const INSURANCE_CATEGORY_TABLES = ["Health", "MedInsurance", "CreditCards"];
+
+function buildCategoryRowValues(draft, rate, sumHkd, rowId, syncHash, tableName) {
   const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
+
+  if (INSURANCE_CATEGORY_TABLES.includes(tableName)) {
+    // Old, pre-insurance-cleanup 17-column layout, preserved on purpose for this table, plus
+    // RowID/SyncHash appended at the end (19 total). Column order confirmed 2026-08-20 via
+    // scripts/inspect-excel-structure.js: Дата, Категория, Описание, Локация, Сумма, Валюта,
+    // Курс, Сумма (HKD), Примечание, Метод оплаты, Получатель/Сотрудник, Страховка, Статус
+    // выплаты, Пользователь, Страховая компания, Период покрытия, Карта.
+    return [
+      draft.dateDdMmYyyy, // Дата
+      draft.subcategory, // Категория
+      draft.description, // Описание
+      draft.location, // Локация
+      draft.amount, // Сумма
+      draft.currency, // Валюта
+      rate, // Курс
+      sumHkd, // Сумма (HKD)
+      notesCell, // Примечание
+      draft.paymentMethod || PAYMENT_METHOD_UNCLEAR, // Метод оплаты
+      draft.recipient || "", // Получатель/Сотрудник
+      "", // Страховка — not collected via Telegram, left blank
+      "", // Статус выплаты — not collected via Telegram, left blank
+      draft.sender || "Unknown", // Пользователь
+      "", // Страховая компания — not collected via Telegram, left blank
+      "", // Период покрытия — not collected via Telegram, left blank
+      "", // Карта — not collected via Telegram, left blank
+      rowId || "", // RowID
+      syncHash || "", // SyncHash
+    ];
+  }
 
   return [
     draft.dateDdMmYyyy, // Дата
@@ -908,7 +980,7 @@ async function appendTransactionToExcel(draft) {
   }
 
   try {
-    const categoryRow = buildCategoryRowValues(draft, fx.rate, fx.sumHkd, rowId, syncHash);
+    const categoryRow = buildCategoryRowValues(draft, fx.rate, fx.sumHkd, rowId, syncHash, tableName);
     await appendTableRow(driveId, itemId, tableName, categoryRow);
   } catch (err) {
     err.rawSucceeded = true;
@@ -1031,7 +1103,10 @@ async function bootstrap() {
   const itemId = getExcelItemIdFromEnv();
 
   categoryAliasMap = parseCategoryMappingEnv();
-  allowedCategories = [...Object.keys(CATEGORY_TABLE_MAP), INCOME_SHEET];
+  allowedCategories = [
+    ...Object.keys(CATEGORY_TABLE_MAP).filter((c) => !MANUAL_ONLY_CATEGORIES.includes(c)),
+    INCOME_SHEET,
+  ];
 
   loadCustomPaymentMethods();
   console.log(
@@ -1090,11 +1165,15 @@ async function runDailyMaintenanceJobs() {
     tableName: CURRENCY_RATES_TABLE_NAME,
   });
 
+  const syncableCategoryTableMap = Object.fromEntries(
+    Object.entries(CATEGORY_TABLE_MAP).filter(([category]) => !MANUAL_ONLY_CATEGORIES.includes(category))
+  );
+
   const sync = await runSync({
     driveId,
     itemId,
     rawSheetName: RAW_SHEET,
-    categoryTableMap: CATEGORY_TABLE_MAP,
+    categoryTableMap: syncableCategoryTableMap,
   });
 
   const report = [formatDailyJobsReport({ currencyRates }), "", formatSyncReport(sync)].join("\n");
@@ -1534,9 +1613,12 @@ async function handleCallbackQuery(callbackQuery) {
       const saved = addCustomPaymentMethod(entry.draft.paymentMethodRaw);
       entry.draft.paymentMethod = saved || entry.draft.paymentMethodRaw;
     } else {
-      // Declined: clear paymentMethodRaw so keyboardForDraft falls through to the plain picker
-      // instead of re-showing this same "new method?" prompt in a loop.
-      entry.draft.paymentMethodRaw = "";
+      // Declined: per Mariya (2026-08-20), do NOT discard the expense and do NOT force a pick
+      // from the fixed list — resolve paymentMethod straight to PAYMENT_METHOD_UNFAMILIAR so
+      // keyboardForDraft falls through to buildConfirmKeyboard and the draft can be logged as-is,
+      // just flagged for later cleanup. paymentMethodRaw is kept (not cleared) so the original
+      // guess is still visible in the draft preview/notes if useful.
+      entry.draft.paymentMethod = PAYMENT_METHOD_UNFAMILIAR;
     }
 
     const newpmThreadExtras =

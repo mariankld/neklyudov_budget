@@ -50,7 +50,8 @@ const RAW_COLS = {
   syncHash: 13,
 };
 
-const CAT_COLS = {
+// Standard 14-column layout — every category table except Health/MedInsurance (see below).
+const STANDARD_CAT_COLS = {
   date: 0,
   subcategory: 1, // Категория
   description: 2, // Описание
@@ -67,6 +68,45 @@ const CAT_COLS = {
   syncHash: 13,
 };
 
+/**
+ * Health and MedInsurance (Insurance category) kept their 5 insurance columns (Страховка,
+ * Статус выплаты, Страховая компания, Период покрытия, Карта) on Mariya's instruction
+ * (2026-08-20) instead of getting the same 17->12 cleanup every other category table got on
+ * 2026-08-19 — so their column order/width genuinely differs from STANDARD_CAT_COLS. Keep in
+ * sync with index.js's buildCategoryRowValues (INSURANCE_CATEGORY_TABLES) and
+ * scripts/migrate-workbook.js (INSURANCE_TABLES) — all three must agree.
+ *
+ * CreditCards was added here 2026-08-20 too, once Mariya confirmed she wants Credit Cards
+ * loggable again: a live header check (scripts/migrate-workbook.js) showed CreditCards is
+ * currently sitting at the exact same 17-column layout as Health/MedInsurance (it also never got
+ * the 2026-08-19 cleanup) — nothing to do with insurance, it just happens to share the identical
+ * column positions, so it safely reuses INSURANCE_CAT_COLS rather than needing a third map.
+ */
+const INSURANCE_CATEGORY_TABLES = ["Health", "MedInsurance", "CreditCards"];
+const INSURANCE_CAT_COLS = {
+  date: 0,
+  subcategory: 1, // Категория
+  description: 2, // Описание
+  location: 3, // Локация
+  amount: 4, // Сумма
+  currency: 5, // Валюта
+  rate: 6, // Курс
+  sumHkd: 7, // Сумма (HKD)
+  notes: 8, // Примечание
+  paymentMethod: 9, // Метод оплаты
+  recipient: 10, // Получатель/Сотрудник
+  // 11 Страховка, 12 Статус выплаты — insurance-only, never touched by the sync job
+  sender: 13, // Пользователь
+  // 14 Страховая компания, 15 Период покрытия, 16 Карта — insurance-only, never touched
+  rowId: 17,
+  syncHash: 18,
+};
+
+/** Picks the right column map for a given category Excel Table name. */
+function catColsFor(tableName) {
+  return INSURANCE_CATEGORY_TABLES.includes(tableName) ? INSURANCE_CAT_COLS : STANDARD_CAT_COLS;
+}
+
 function mergeableFieldsFromRaw(row) {
   return {
     date: row[RAW_COLS.date],
@@ -80,16 +120,16 @@ function mergeableFieldsFromRaw(row) {
   };
 }
 
-function mergeableFieldsFromCategory(row) {
+function mergeableFieldsFromCategory(row, catCols) {
   return {
-    date: row[CAT_COLS.date],
-    description: row[CAT_COLS.description],
-    location: row[CAT_COLS.location],
-    amount: Number(row[CAT_COLS.amount]),
-    currency: String(row[CAT_COLS.currency] || "").trim().toUpperCase(),
-    notes: row[CAT_COLS.notes],
-    paymentMethod: row[CAT_COLS.paymentMethod],
-    subcategory: row[CAT_COLS.subcategory],
+    date: row[catCols.date],
+    description: row[catCols.description],
+    location: row[catCols.location],
+    amount: Number(row[catCols.amount]),
+    currency: String(row[catCols.currency] || "").trim().toUpperCase(),
+    notes: row[catCols.notes],
+    paymentMethod: row[catCols.paymentMethod],
+    subcategory: row[catCols.subcategory],
   };
 }
 
@@ -130,6 +170,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
   });
 
   for (const [categoryLabel, tableName] of Object.entries(categoryTableMap)) {
+    const catCols = catColsFor(tableName);
     let catRows;
     try {
       catRows = await getTableRows(driveId, itemId, tableName);
@@ -140,7 +181,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
 
     for (let ci = 0; ci < catRows.length; ci++) {
       const catRow = [...catRows[ci]];
-      const rowId = catRow[CAT_COLS.rowId];
+      const rowId = catRow[catCols.rowId];
       if (!rowId) continue; // pre-migration row (no RowID yet) — nothing to match against
 
       const rawEntry = rawByRowId.get(String(rowId));
@@ -153,10 +194,10 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
       report.checked++;
 
       const rawFields = mergeableFieldsFromRaw(rawEntry.row);
-      const catFields = mergeableFieldsFromCategory(catRow);
+      const catFields = mergeableFieldsFromCategory(catRow, catCols);
       const rawHash = computeSyncHash(rawFields);
       const catHash = computeSyncHash(catFields);
-      const storedHash = rawEntry.row[RAW_COLS.syncHash] || catRow[CAT_COLS.syncHash] || "";
+      const storedHash = rawEntry.row[RAW_COLS.syncHash] || catRow[catCols.syncHash] || "";
 
       if (rawHash === catHash) {
         if (storedHash !== rawHash) {
@@ -166,7 +207,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
             healedRaw[RAW_COLS.syncHash] = rawHash;
             await updateTableRowByIndex(driveId, itemId, rawSheetName, rawEntry.idx, healedRaw);
             const healedCat = [...catRow];
-            healedCat[CAT_COLS.syncHash] = rawHash;
+            healedCat[catCols.syncHash] = rawHash;
             await updateTableRowByIndex(driveId, itemId, tableName, ci, healedCat);
             report.healed++;
           } catch (err) {
@@ -188,7 +229,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
 
       try {
         if (rawChanged) {
-          await propagate({
+          const { sumHkd } = await propagate({
             driveId,
             itemId,
             fromFields: rawFields,
@@ -196,10 +237,19 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
             targetRow: catRow,
             targetRowIndex: ci,
             targetIsRaw: false,
+            catCols,
           });
           const newHash = computeSyncHash(rawFields);
           const healedRaw = [...rawEntry.row];
           healedRaw[RAW_COLS.syncHash] = newHash;
+          // RAW is the source of truth here (it's what changed), but RAW also carries its own
+          // computed Sum (HKD) column (RAW_COLS.sumHkd) that must stay in step with whatever
+          // amount/currency/rate propagate() just used for the category row — otherwise RAW's
+          // own Sum (HKD) goes stale forever after any RAW-side edit. Reuse the exact sumHkd
+          // propagate() just computed (and wrote into the category row) instead of recomputing
+          // it a second time, so RAW and the category row can never disagree even if the FX
+          // rate happened to change between two separate lookups.
+          healedRaw[RAW_COLS.sumHkd] = sumHkd;
           await updateTableRowByIndex(driveId, itemId, rawSheetName, rawEntry.idx, healedRaw);
           report.propagatedToCategory++;
         } else if (catChanged) {
@@ -211,10 +261,11 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
             targetRow: rawEntry.row,
             targetRowIndex: rawEntry.idx,
             targetIsRaw: true,
+            catCols,
           });
           const newHash = computeSyncHash(catFields);
           const healedCat = [...catRow];
-          healedCat[CAT_COLS.syncHash] = newHash;
+          healedCat[catCols.syncHash] = newHash;
           await updateTableRowByIndex(driveId, itemId, tableName, ci, healedCat);
           report.propagatedToRaw++;
         }
@@ -227,8 +278,13 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
   return report;
 }
 
-/** Writes `fromFields` into the target row (RAW or category shape) and recomputes the frozen FX conversion, then saves it. */
-async function propagate({ driveId, itemId, fromFields, targetTableName, targetRow, targetRowIndex, targetIsRaw }) {
+/**
+ * Writes `fromFields` into the target row (RAW or category shape) and recomputes the frozen FX
+ * conversion, then saves it. `catCols` is required whenever the target (or source) side is a
+ * category table, so insurance-preserving tables (Health/MedInsurance) get written at the right
+ * column offsets instead of the standard ones.
+ */
+async function propagate({ driveId, itemId, fromFields, targetTableName, targetRow, targetRowIndex, targetIsRaw, catCols }) {
   const rate = await fxRates.getRateToHkd(fromFields.currency, fromFields.date);
   const sumHkd = roundMoney(fromFields.amount * rate);
 
@@ -244,19 +300,20 @@ async function propagate({ driveId, itemId, fromFields, targetTableName, targetR
     updated[RAW_COLS.notes] = fromFields.notes;
     updated[RAW_COLS.paymentMethod] = fromFields.paymentMethod;
   } else {
-    updated[CAT_COLS.date] = fromFields.date;
-    updated[CAT_COLS.subcategory] = fromFields.subcategory;
-    updated[CAT_COLS.description] = fromFields.description;
-    updated[CAT_COLS.location] = fromFields.location;
-    updated[CAT_COLS.amount] = fromFields.amount;
-    updated[CAT_COLS.currency] = fromFields.currency;
-    updated[CAT_COLS.rate] = rate;
-    updated[CAT_COLS.sumHkd] = sumHkd;
-    updated[CAT_COLS.notes] = fromFields.notes;
-    updated[CAT_COLS.paymentMethod] = fromFields.paymentMethod;
+    updated[catCols.date] = fromFields.date;
+    updated[catCols.subcategory] = fromFields.subcategory;
+    updated[catCols.description] = fromFields.description;
+    updated[catCols.location] = fromFields.location;
+    updated[catCols.amount] = fromFields.amount;
+    updated[catCols.currency] = fromFields.currency;
+    updated[catCols.rate] = rate;
+    updated[catCols.sumHkd] = sumHkd;
+    updated[catCols.notes] = fromFields.notes;
+    updated[catCols.paymentMethod] = fromFields.paymentMethod;
   }
 
   await updateTableRowByIndex(driveId, itemId, targetTableName, targetRowIndex, updated);
+  return { rate, sumHkd };
 }
 
 function formatSyncReport(report) {
@@ -283,5 +340,8 @@ module.exports = {
   computeSyncHash,
   mergeableFieldsFromRaw,
   RAW_COLS,
-  CAT_COLS,
+  STANDARD_CAT_COLS,
+  INSURANCE_CAT_COLS,
+  INSURANCE_CATEGORY_TABLES,
+  catColsFor,
 };

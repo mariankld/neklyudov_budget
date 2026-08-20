@@ -13,7 +13,8 @@
     "lookup-historical-rate": "node scripts/lookup-historical-rate.js",
     "audit-summary": "node scripts/audit-summary-formulas.js",
     "fix-summary": "node scripts/fix-summary-formulas.js",
-    "fix-h20-credit-card": "node scripts/fix-h20-credit-card-total.js"
+    "fix-h20-credit-card": "node scripts/fix-h20-credit-card-total.js",
+    "migrate-workbook": "node scripts/migrate-workbook.js"
   },
   "keywords": [],
   "author": "",
