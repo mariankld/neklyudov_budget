@@ -456,7 +456,10 @@ function buildTransactionJsonSchema() {
       location: { type: "string" },
       currency: { type: "string" },
       notes: { type: "string" },
-      paymentMethod: { type: "string", enum: [...getPaymentMethods(), PAYMENT_METHOD_UNCLEAR] },
+      paymentMethod: {
+        type: "string",
+        enum: [...getPaymentMethods(), PAYMENT_METHOD_UNCLEAR, PAYMENT_METHOD_UNFAMILIAR],
+      },
       paymentMethodRaw: { type: "string" },
       recipient: { type: "string" },
       /** dd/mm/yyyy if an explicit or relative date is stated/legible, else null — never guessed. */
@@ -494,6 +497,58 @@ function parseDateDdMmYyyy(str) {
   return d;
 }
 
+const WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+
+/**
+ * Bug fix (2026-08-20): "yesterday" was once resolved by the LLM to 30/09/2023 instead of the
+ * correct real-world date, because relative-date words were 100% trusted to model reasoning with
+ * zero deterministic check. For the unambiguous, purely-arithmetic cases (yesterday/today/tomorrow,
+ * "N days ago", "last <weekday>") we now compute the answer ourselves from the real Telegram
+ * message timestamp and overwrite whatever the model returned — these words have exactly one
+ * correct answer given an anchor date, so there's no reason to leave them to chance. Anything
+ * fuzzier (an OCR'd receipt date, "on 15/03") is still left to the model. Mutates `parsed.date`
+ * in place; no-op if `text` contains none of these patterns.
+ */
+function applyDeterministicRelativeDate(parsed, text, messageDate) {
+  if (typeof text !== "string" || !text.trim() || !parsed) return;
+  const t = text.toLowerCase();
+  const anchor = messageDate instanceof Date && !isNaN(messageDate) ? new Date(messageDate) : new Date();
+  anchor.setHours(0, 0, 0, 0);
+
+  const setDays = (offset) => {
+    const d = new Date(anchor);
+    d.setDate(d.getDate() + offset);
+    parsed.date = formatDateDdMmYyyy(d);
+  };
+
+  if (/\byesterday\b/.test(t)) {
+    setDays(-1);
+    return;
+  }
+  if (/\btomorrow\b/.test(t)) {
+    setDays(1);
+    return;
+  }
+  if (/\btoday\b|\btonight\b/.test(t)) {
+    setDays(0);
+    return;
+  }
+  const daysAgoMatch = t.match(/\b(\d+)\s+days?\s+ago\b/);
+  if (daysAgoMatch) {
+    setDays(-Number(daysAgoMatch[1]));
+    return;
+  }
+  const lastWeekdayMatch = t.match(
+    /\blast\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/
+  );
+  if (lastWeekdayMatch) {
+    const targetDow = WEEKDAY_NAMES.indexOf(lastWeekdayMatch[1]);
+    let diff = (anchor.getDay() - targetDow + 7) % 7;
+    if (diff === 0) diff = 7; // "last Friday" always means the previous one, even if today is Friday.
+    setDays(-diff);
+  }
+}
+
 function buildAnalysisPrompt(messageText, contextDateLabel) {
   const categoryList = allowedCategories.join(", ");
   return [
@@ -518,12 +573,13 @@ function buildAnalysisPrompt(messageText, contextDateLabel) {
   ].join("\n");
 }
 
-function buildEditPrompt(currentDraft, editInstruction, originalMessage) {
+function buildEditPrompt(currentDraft, editInstruction, originalMessage, contextDateLabel) {
   const categoryList = allowedCategories.join(", ");
   return [
+    `The real-world date context for this edit is ${contextDateLabel} — use this exact date as "today" for resolving any relative date in the edit instruction. Never substitute a different notion of today.`,
     "Apply the user's edit instructions to this draft. Keep other fields unchanged unless the edit implies them.",
-    `This includes paymentMethod: keep its current value unless the edit instruction explicitly changes the payment method. paymentMethod MUST be exactly one of these strings — no other value is valid: ${getPaymentMethods().map((m) => `"${m}"`).join(", ")}. If the edit instruction requests a payment method that doesn't clearly match one of these, use "${PAYMENT_METHOD_UNCLEAR}" instead of inventing a new value.`,
-    "This also includes date (currently dd/mm/yyyy in the draft): keep it unchanged unless the edit instruction explicitly gives a new date, e.g. \"date to 15/03/2026\", \"change date to yesterday\", \"it was actually last Friday\" — resolve relative dates the same way. Always output date as dd/mm/yyyy, never null, when editing an existing draft.",
+    `This includes paymentMethod: keep its current value unless the edit instruction explicitly changes the payment method — this is true even if the current value is "${PAYMENT_METHOD_UNCLEAR}" or "${PAYMENT_METHOD_UNFAMILIAR}"; those are valid values to copy forward unchanged too, not just the list below. paymentMethod MUST be exactly one of these strings — no other value is valid: ${getPaymentMethods().map((m) => `"${m}"`).join(", ")}, "${PAYMENT_METHOD_UNCLEAR}", "${PAYMENT_METHOD_UNFAMILIAR}". If the edit instruction requests a payment method that doesn't clearly match one of the named methods, use "${PAYMENT_METHOD_UNCLEAR}" instead of inventing a new value.`,
+    `This also includes date (currently dd/mm/yyyy in the draft): keep it unchanged unless the edit instruction explicitly gives a new date, e.g. "date to 15/03/2026", "change date to yesterday", "it was actually last Friday" — resolve relative dates strictly relative to ${contextDateLabel} (the context date above), never relative to any other date. Always output date as dd/mm/yyyy, never null, when editing an existing draft.`,
     `Allowed categories: ${categoryList}. Never use "${RAW_SHEET}" as category name.`,
     "",
     "Current draft (JSON):",
@@ -657,18 +713,22 @@ async function parseTransactionFromImage(base64Image, mimeType, captionText, mes
   return JSON.parse(raw);
 }
 
-async function parseEditWithOpenAI(currentDraft, editInstruction, originalMessage) {
+async function parseEditWithOpenAI(currentDraft, editInstruction, originalMessage, messageDate) {
+  // Bug fix (2026-08-20): this call previously had no date context at all, so any relative-date
+  // edit ("this was yesterday") was resolved against the model's own notion of "today" instead of
+  // the real message date — e.g. it once produced 30/09/2023. Mirror the analysis flow: compute
+  // the context date from the original message's timestamp and tell the model explicitly.
+  const contextDateLabel = formatContextDateLabel(messageDate);
   const completion = await openai.responses.create({
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
     input: [
       {
         role: "system",
-        content:
-          "You update a budget transaction draft from user edit instructions. Preserve unspecified fields. Output strict JSON only.",
+        content: `You update a budget transaction draft from user edit instructions. Preserve unspecified fields. Output strict JSON only. Today for context is ${contextDateLabel}.`,
       },
       {
         role: "user",
-        content: buildEditPrompt(currentDraft, editInstruction, originalMessage),
+        content: buildEditPrompt(currentDraft, editInstruction, originalMessage, contextDateLabel),
       },
     ],
     text: {
@@ -1250,6 +1310,7 @@ async function processExpenseFlow(chatId, originalMessage, sender, messageId, me
   await sendTelegramMessage(chatId, "⏳ Analyzing your message...", messageId, undefined, threadExtras);
 
   const parsed = await parseTransactionWithOpenAI(originalMessage, messageDate);
+  applyDeterministicRelativeDate(parsed, originalMessage, messageDate);
   await presentDraftForConfirmation(parsed, {
     chatId,
     originalMessage,
@@ -1270,6 +1331,7 @@ async function processImageExpenseFlow(chatId, fileId, captionText, sender, mess
   const mimeType = guessImageMimeType(filePath);
 
   const parsed = await parseTransactionFromImage(base64Image, mimeType, captionText, messageDate);
+  applyDeterministicRelativeDate(parsed, captionText, messageDate);
   const originalMessageLabel =
     captionText && captionText.trim() ? `[photo] ${captionText.trim()}` : "[photo]";
 
@@ -1328,7 +1390,8 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
 
   try {
     await sendTelegramMessage(chatId, "⏳ Updating your draft...", messageId, undefined, threadExtras);
-    const parsed = await parseEditWithOpenAI(flatDraft, editText, entry.originalMessage);
+    const parsed = await parseEditWithOpenAI(flatDraft, editText, entry.originalMessage, entry.messageDate);
+    applyDeterministicRelativeDate(parsed, editText, entry.messageDate);
     const draft = normalizeDraft(parsed, entry.messageDate);
     draft.sender = entry.sender || "Unknown";
     const categorySheetName = draft.category;
