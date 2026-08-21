@@ -1230,19 +1230,18 @@ function getWelcomeMessage() {
   return [
     `👋 Hello, ${FAMILY_GREETING_NAME} family! The Budget Bot is now active and ready to track your expenses!`,
     "",
-    "📝 To log an expense, simply send a message like:",
-    '• "Spent 500 on groceries"',
-    '• "250 taxi"',
-    '• "1200 dinner at restaurant"',
-    '• "Купил продукты на 800"',
+    "📝 To log an expense, ",
     "",
-    "I'll analyze the amount and description, show a preview (category + RAW columns), and wait for you to tap Yes, log it or Edit before anything is saved. ✅",
+    '* Simply send a message like: "Spent 500 on groceries", "250 taxi" and "Купил продукты на 800"',
+    "* Or send a photo or a screenshot of you receipt and I will extract all the info myself! ",
     "",
-    "If you're editing and change your mind, send /cancel.",
+    "I'll analyze the amount, show a preview (category + RAW columns), and wait for you to tap Yes, log it or Edit before anything is saved. ✅",
     "",
-    "Just want to leave a comment without logging anything? Start your message with /ignore, e.g. \"/ignore already reimbursed by roommate\".",
+    "Commands: ",
     "",
-    "RAW and the category tabs sync automatically every day. If you edited a row directly in Excel and want it reflected right away, send /sync.",
+    "* If you're editing and change your mind, send /cancel.",
+    "* To leave a comment or send a message without triggering the bot start your message with /ignore, e.g. \"/ignore already logged this expense\".",
+    "* To prevent inconsistencies, RAW and the category tabs sync automatically every day. If you edited a row directly in Excel and want it reflected right away, send /sync.",
   ].join("\n");
 }
 
