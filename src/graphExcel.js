@@ -99,28 +99,67 @@ async function appendTableRow(driveId, itemId, tableName, values) {
   }
 }
 
-/** Reads every data row of a named Excel Table (no header row) — used by the sync job and FX-history hydration. */
+/**
+ * Reads every data row of a named Excel Table (no header row) — used by the sync job and
+ * FX-history hydration.
+ *
+ * Bug fix (2026-08-21): Graph's Tables API has a known quirk where this endpoint returns
+ * 404 "ItemNotFound" for a table that currently has zero data rows (header row only),
+ * instead of the `{ value: [] }` every other empty collection returns — this is what broke
+ * /sync's CurrencyRates refresh ("Could not read "CurrencyRates" rows — Request failed with
+ * status code 404") even though the table genuinely exists (its headers read back fine
+ * moments earlier in refreshCurrencyRatesTable). Since every caller of this function already
+ * only reaches it after establishing the table exists, treat a 404 here as "no data rows
+ * yet" and return [] instead of throwing — otherwise any table that's temporarily empty
+ * (CurrencyRates cleared, or a category table with no transactions yet) permanently breaks
+ * the daily refresh/sync job instead of just reporting nothing to do.
+ */
 async function getTableRows(driveId, itemId, tableName) {
   const token = await getAccessToken();
-  const { data } = await axios.get(
-    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
-      tableName
-    )}')/rows`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  return (data.value || []).map((r) => r.values[0]);
+  try {
+    const { data } = await axios.get(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
+        tableName
+      )}')/rows`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    return (data.value || []).map((r) => r.values[0]);
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      return [];
+    }
+    if (err.response && err.response.data) {
+      const graphError = err.response.data.error || err.response.data;
+      err.graphDetail = `[${tableName} rows] ${graphError.code || ""} ${
+        graphError.message || JSON.stringify(graphError)
+      }`.trim();
+      err.message = err.graphDetail;
+    }
+    throw err;
+  }
 }
 
 /** Reads a table's header row (column names in order) — used to locate columns by name instead of a hardcoded index. */
 async function getTableHeaders(driveId, itemId, tableName) {
   const token = await getAccessToken();
-  const { data } = await axios.get(
-    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
-      tableName
-    )}')/headerRowRange`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  return data.values[0];
+  try {
+    const { data } = await axios.get(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
+        tableName
+      )}')/headerRowRange`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    return data.values[0];
+  } catch (err) {
+    if (err.response && err.response.data) {
+      const graphError = err.response.data.error || err.response.data;
+      err.graphDetail = `[${tableName} headers] ${graphError.code || ""} ${
+        graphError.message || JSON.stringify(graphError)
+      }`.trim();
+      err.message = err.graphDetail;
+    }
+    throw err;
+  }
 }
 
 /**
