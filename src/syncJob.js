@@ -121,6 +121,67 @@ function catColsFor(tableName) {
   return INSURANCE_CATEGORY_TABLES.includes(tableName) ? INSURANCE_CAT_COLS : STANDARD_CAT_COLS;
 }
 
+// Human-readable header names, purely for sync-report messages (e.g. "Amended columns in
+// RAW: Sum (HKD)"). Must match the real header text (see README.md's "Row shape appended by
+// the app" section) — RAW's headers are English, category tables' are Russian. One map
+// covers both STANDARD_CAT_COLS and INSURANCE_CAT_COLS since the header *names* are
+// identical between them; only the column *index* differs (handled by catColsFor above).
+const RAW_COL_DISPLAY_NAMES = {
+  date: "Date",
+  subcategory: "Subcategory",
+  description: "Description",
+  location: "Location",
+  amount: "Amount",
+  currency: "Currency",
+  sumHkd: "Sum (HKD)",
+  notes: "Notes",
+  paymentMethod: "Payment Method",
+};
+const CAT_COL_DISPLAY_NAMES = {
+  date: "Дата",
+  subcategory: "Категория",
+  description: "Описание",
+  location: "Локация",
+  amount: "Сумма",
+  currency: "Валюта",
+  rate: "Курс",
+  sumHkd: "Сумма (HKD)",
+  notes: "Примечание",
+  paymentMethod: "Метод оплаты",
+};
+
+/**
+ * Compares `oldRow`'s existing values against the fields sync is about to write
+ * (`writtenFields`, keyed the same as `colsMap`) and returns the display names of only the
+ * columns whose value is actually changing — so the sync report can say precisely what
+ * changed instead of just "row updated". Numeric-looking values are compared numerically
+ * (so `100` vs `"100.0"` isn't reported as a change).
+ */
+function diffColumns(oldRow, writtenFields, colsMap, displayNames) {
+  const changed = [];
+  for (const [key, newVal] of Object.entries(writtenFields)) {
+    const idx = colsMap[key];
+    if (idx === undefined) continue;
+    const oldVal = oldRow[idx];
+    const oldNum = Number(oldVal);
+    const newNum = Number(newVal);
+    const bothNumeric = oldVal !== "" && newVal !== "" && oldVal != null && newVal != null && !Number.isNaN(oldNum) && !Number.isNaN(newNum);
+    const same = bothNumeric ? oldNum === newNum : String(oldVal == null ? "" : oldVal) === String(newVal == null ? "" : newVal);
+    if (!same) changed.push(displayNames[key] || key);
+  }
+  return changed;
+}
+
+/** One line (+ optional "Amended columns" sub-lines) describing a single propagated edit. */
+function buildAmendedBlock({ description, sourceLabel, targetLabel, targetChangedCols, sourceChangedCols }) {
+  const lines = [
+    `1 expense amended in ${targetLabel} because it was changed in ${sourceLabel} (${description || "no description"}).`,
+  ];
+  if (targetChangedCols.length) lines.push(`Amended columns in ${targetLabel}: ${targetChangedCols.join(", ")}`);
+  if (sourceChangedCols.length) lines.push(`Amended columns in ${sourceLabel}: ${sourceChangedCols.join(", ")}`);
+  return lines.join("\n");
+}
+
 function mergeableFieldsFromRaw(row) {
   return {
     date: row[RAW_COLS.date],
@@ -166,6 +227,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
     propagatedToRaw: 0,
     healed: 0,
     deletedFromCategory: 0,
+    changeLines: [],
     conflicts: [],
     errors: [],
   };
@@ -258,7 +320,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
 
       try {
         if (rawChanged) {
-          const { sumHkd } = await propagate({
+          const { sumHkd, writtenFields } = await propagate({
             driveId,
             itemId,
             fromFields: rawFields,
@@ -268,6 +330,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
             targetIsRaw: false,
             catCols,
           });
+          const catChangedCols = diffColumns(catRow, writtenFields, catCols, CAT_COL_DISPLAY_NAMES);
           const newHash = computeSyncHash(rawFields);
           const healedRaw = [...rawEntry.row];
           healedRaw[RAW_COLS.syncHash] = newHash;
@@ -278,11 +341,21 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
           // propagate() just computed (and wrote into the category row) instead of recomputing
           // it a second time, so RAW and the category row can never disagree even if the FX
           // rate happened to change between two separate lookups.
+          const rawChangedCols = diffColumns(rawEntry.row, { sumHkd }, RAW_COLS, RAW_COL_DISPLAY_NAMES);
           healedRaw[RAW_COLS.sumHkd] = sumHkd;
           await updateTableRowByIndex(driveId, itemId, rawSheetName, rawEntry.idx, healedRaw);
           report.propagatedToCategory++;
+          report.changeLines.push(
+            buildAmendedBlock({
+              description: rawFields.description,
+              sourceLabel: "RAW",
+              targetLabel: `"${tableName}"`,
+              targetChangedCols: catChangedCols,
+              sourceChangedCols: rawChangedCols,
+            })
+          );
         } else if (catChanged) {
-          await propagate({
+          const { writtenFields } = await propagate({
             driveId,
             itemId,
             fromFields: catFields,
@@ -292,11 +365,21 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
             targetIsRaw: true,
             catCols,
           });
+          const rawChangedCols = diffColumns(rawEntry.row, writtenFields, RAW_COLS, RAW_COL_DISPLAY_NAMES);
           const newHash = computeSyncHash(catFields);
           const healedCat = [...catRow];
           healedCat[catCols.syncHash] = newHash;
           await updateTableRowByIndex(driveId, itemId, tableName, ci, healedCat);
           report.propagatedToRaw++;
+          report.changeLines.push(
+            buildAmendedBlock({
+              description: catFields.description,
+              sourceLabel: `"${tableName}"`,
+              targetLabel: "RAW",
+              targetChangedCols: rawChangedCols,
+              sourceChangedCols: [],
+            })
+          );
         }
       } catch (err) {
         report.errors.push(`${tableName} row ${ci + 1} (RowID ${rowId}): propagation failed — ${err.message}`);
@@ -306,10 +389,15 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
     // Apply queued deletions highest-index-first so deleting one row never invalidates the
     // index of another row still waiting to be deleted in this same table.
     for (const ci of catRowIndicesToDelete.sort((a, b) => b - a)) {
-      const rowId = catRows[ci][catCols.rowId];
+      const deletedRow = catRows[ci];
+      const rowId = deletedRow[catCols.rowId];
+      const description = deletedRow[catCols.description];
       try {
         await deleteTableRowByIndex(driveId, itemId, tableName, ci);
         report.deletedFromCategory++;
+        report.changeLines.push(
+          `1 expense deleted in "${tableName}" because it was deleted in RAW (${description || "no description"}).`
+        );
       } catch (err) {
         report.errors.push(
           `"${tableName}" row ${ci + 1} (RowID ${rowId}): failed to delete to mirror its RAW deletion — ${err.message}`
@@ -324,7 +412,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
   for (const [rowIdStr, entry] of rawByRowId.entries()) {
     if (rawRowIdsMatchedToCategory.has(rowIdStr)) continue;
     const row = entry.row;
-    const type = row[RAW_COLS.type];
+    const type = String(row[RAW_COLS.type] || "").trim().toLowerCase();
     if (type !== "expense") continue; // non-expense rows never get a category-side row
     const category = row[RAW_COLS.category];
     const tableName = categoryTableMap[category];
@@ -350,6 +438,10 @@ async function propagate({ driveId, itemId, fromFields, targetTableName, targetR
   const sumHkd = roundMoney(fromFields.amount * rate);
 
   const updated = [...targetRow];
+  // writtenFields mirrors exactly what's assigned below, keyed the same as RAW_COLS/catCols
+  // — the sync report diffs this against the row's pre-write values (diffColumns) to say
+  // precisely which columns changed, so keep the two in sync if this ever changes.
+  let writtenFields;
   if (targetIsRaw) {
     updated[RAW_COLS.date] = fromFields.date;
     updated[RAW_COLS.subcategory] = fromFields.subcategory;
@@ -360,6 +452,17 @@ async function propagate({ driveId, itemId, fromFields, targetTableName, targetR
     updated[RAW_COLS.sumHkd] = sumHkd;
     updated[RAW_COLS.notes] = fromFields.notes;
     updated[RAW_COLS.paymentMethod] = fromFields.paymentMethod;
+    writtenFields = {
+      date: fromFields.date,
+      subcategory: fromFields.subcategory,
+      description: fromFields.description,
+      location: fromFields.location,
+      amount: fromFields.amount,
+      currency: fromFields.currency,
+      sumHkd,
+      notes: fromFields.notes,
+      paymentMethod: fromFields.paymentMethod,
+    };
   } else {
     updated[catCols.date] = fromFields.date;
     updated[catCols.subcategory] = fromFields.subcategory;
@@ -371,10 +474,22 @@ async function propagate({ driveId, itemId, fromFields, targetTableName, targetR
     updated[catCols.sumHkd] = sumHkd;
     updated[catCols.notes] = fromFields.notes;
     updated[catCols.paymentMethod] = fromFields.paymentMethod;
+    writtenFields = {
+      date: fromFields.date,
+      subcategory: fromFields.subcategory,
+      description: fromFields.description,
+      location: fromFields.location,
+      amount: fromFields.amount,
+      currency: fromFields.currency,
+      rate,
+      sumHkd,
+      notes: fromFields.notes,
+      paymentMethod: fromFields.paymentMethod,
+    };
   }
 
   await updateTableRowByIndex(driveId, itemId, targetTableName, targetRowIndex, updated);
-  return { rate, sumHkd };
+  return { rate, sumHkd, writtenFields };
 }
 
 function formatSyncReport(report) {
@@ -382,6 +497,13 @@ function formatSyncReport(report) {
     `Checked ${report.checked} matched row${report.checked === 1 ? "" : "s"}.`,
     `→ category: ${report.propagatedToCategory}, → RAW: ${report.propagatedToRaw}, healed: ${report.healed}, deleted from category (mirroring RAW): ${report.deletedFromCategory}.`,
   ];
+  if (report.changeLines && report.changeLines.length) {
+    lines.push("");
+    report.changeLines.forEach((block, i) => {
+      if (i > 0) lines.push("");
+      lines.push(block);
+    });
+  }
   if (report.conflicts.length) {
     lines.push(`⚠️ ${report.conflicts.length} conflict(s):`);
     report.conflicts.slice(0, 10).forEach((c) => lines.push(`- ${c}`));
