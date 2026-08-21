@@ -1232,16 +1232,16 @@ function getWelcomeMessage() {
     "",
     "📝 To log an expense, ",
     "",
-    '* Simply send a message like: "Spent 500 on groceries", "250 taxi" and "Купил продукты на 800"',
-    "* Or send a photo or a screenshot of you receipt and I will extract all the info myself! ",
+    '• Simply send a message like: "Spent 500 on groceries", "250 taxi" and "Купил продукты на 800"',
+    "• Or send a photo or a screenshot of you receipt and I will extract all the info myself! ",
     "",
     "I'll analyze the amount, show a preview (category + RAW columns), and wait for you to tap Yes, log it or Edit before anything is saved. ✅",
     "",
     "Commands: ",
     "",
-    "* If you're editing and change your mind, send /cancel.",
-    "* To leave a comment or send a message without triggering the bot start your message with /ignore, e.g. \"/ignore already logged this expense\".",
-    "* To prevent inconsistencies, RAW and the category tabs sync automatically every day. If you edited a row directly in Excel and want it reflected right away, send /sync.",
+    "• If you're editing and change your mind, send /cancel.",
+    "• To leave a comment or send a message without triggering the bot, start your message with /ignore, e.g. \"/ignore I already logged this expense\".",
+    "• To prevent inconsistencies, RAW and the category tabs sync automatically every day. If you edited a row directly in Excel and want it reflected right away, send /sync.",
   ].join("\n");
 }
 
