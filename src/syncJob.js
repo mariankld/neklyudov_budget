@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const {
   getTableRows,
   updateTableRowByIndex,
+  deleteTableRowByIndex,
 } = require("./graphExcel");
 const fxRates = require("./fxRates");
 
@@ -24,11 +25,24 @@ const fxRates = require("./fxRates");
  *   4. If Date, Amount, or Currency changed, the frozen Курс/Sum (HKD) are recomputed via
  *      fxRates (date change -> a fresh historical lookup; amount-only change -> the FX
  *      cache returns the same day's already-fetched rate, so it's effectively reused).
+ *   5. Deletion propagation (2026-08-21, Mariya's request — she deleted a RAW row on
+ *      purpose to test this): if a category row's RowID has no matching RAW row, RAW is
+ *      treated as the source of truth and the category row is deleted to mirror it. This is
+ *      deliberately one-directional. The opposite case — a RAW row whose category-table
+ *      counterpart is missing — is NOT auto-deleted from RAW; it's only reported as a
+ *      conflict. That's because appendTransactionToExcel (index.js) writes RAW first and the
+ *      category row second, so "RAW exists, category row doesn't" is exactly the signature
+ *      left behind by a *failed* category write (already surfaced to Mariya as an error at
+ *      log time via err.rawSucceeded), not just a deliberate deletion. Auto-deleting RAW in
+ *      that case risks silently destroying a legitimately-logged transaction, so it's
+ *      surfaced for manual review instead.
  *
  * Deliberately NOT auto-synced (out of scope / too destructive to automate safely):
  *   - Category/Type changes (moving a row to a different category table).
  *   - RAW deletions/insertions that don't have a RowID (pre-migration rows) — skipped.
  *   - Получатель/Сотрудник (Recipient) — RAW has no equivalent column to sync it into.
+ *   - A RAW row whose category-table counterpart is missing (see point 5 above) — reported,
+ *     not auto-deleted.
  */
 
 // Fixed column indices — both tables are written exclusively by buildRawRowValues /
@@ -151,6 +165,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
     propagatedToCategory: 0,
     propagatedToRaw: 0,
     healed: 0,
+    deletedFromCategory: 0,
     conflicts: [],
     errors: [],
   };
@@ -169,6 +184,14 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
     if (rowId) rawByRowId.set(String(rowId), { row: [...row], idx });
   });
 
+  // Populated as each category table is scanned below — lets the second pass (RAW rows
+  // whose category counterpart is missing) tell "the table read failed, we don't actually
+  // know" apart from "the table read fine and this RowID genuinely isn't in it".
+  const successfullyReadCategoryTables = new Set();
+  // RowIDs seen matched in some category table — anything left over after the loop, that's
+  // supposed to have a category row (expense type, known category), is the reverse orphan.
+  const rawRowIdsMatchedToCategory = new Set();
+
   for (const [categoryLabel, tableName] of Object.entries(categoryTableMap)) {
     const catCols = catColsFor(tableName);
     let catRows;
@@ -178,6 +201,9 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
       report.errors.push(`${tableName}: could not read rows — ${err.message}`);
       continue;
     }
+    successfullyReadCategoryTables.add(tableName);
+
+    const catRowIndicesToDelete = [];
 
     for (let ci = 0; ci < catRows.length; ci++) {
       const catRow = [...catRows[ci]];
@@ -186,11 +212,14 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
 
       const rawEntry = rawByRowId.get(String(rowId));
       if (!rawEntry) {
-        report.conflicts.push(
-          `"${tableName}" row ${ci + 1} (RowID ${rowId}) has no matching row in ${rawSheetName} — check whether it was deleted from RAW.`
-        );
+        // RAW is the source of truth: if it no longer has this RowID, mirror the deletion
+        // onto the category side rather than just flagging it. Queue it — deletes shift
+        // subsequent row indices, so they're all applied after this table's scan finishes,
+        // in descending index order (see below).
+        catRowIndicesToDelete.push(ci);
         continue;
       }
+      rawRowIdsMatchedToCategory.add(String(rowId));
       report.checked++;
 
       const rawFields = mergeableFieldsFromRaw(rawEntry.row);
@@ -273,6 +302,38 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
         report.errors.push(`${tableName} row ${ci + 1} (RowID ${rowId}): propagation failed — ${err.message}`);
       }
     }
+
+    // Apply queued deletions highest-index-first so deleting one row never invalidates the
+    // index of another row still waiting to be deleted in this same table.
+    for (const ci of catRowIndicesToDelete.sort((a, b) => b - a)) {
+      const rowId = catRows[ci][catCols.rowId];
+      try {
+        await deleteTableRowByIndex(driveId, itemId, tableName, ci);
+        report.deletedFromCategory++;
+      } catch (err) {
+        report.errors.push(
+          `"${tableName}" row ${ci + 1} (RowID ${rowId}): failed to delete to mirror its RAW deletion — ${err.message}`
+        );
+      }
+    }
+  }
+
+  // Reverse direction: an expense RAW row whose category-table counterpart is missing.
+  // Deliberately report-only (see the module doc comment above) — NOT auto-deleted, since
+  // this exact signature is also what a failed category-table write leaves behind.
+  for (const [rowIdStr, entry] of rawByRowId.entries()) {
+    if (rawRowIdsMatchedToCategory.has(rowIdStr)) continue;
+    const row = entry.row;
+    const type = row[RAW_COLS.type];
+    if (type !== "expense") continue; // non-expense rows never get a category-side row
+    const category = row[RAW_COLS.category];
+    const tableName = categoryTableMap[category];
+    if (!tableName) continue; // unknown/unconfigured category — nothing to compare against
+    if (!successfullyReadCategoryTables.has(tableName)) continue; // that table's read failed — we don't actually know
+
+    report.conflicts.push(
+      `"${rawSheetName}" row ${entry.idx + 1} (RowID ${rowIdStr}, category "${category}") has no matching row in "${tableName}" — either it was deleted from ${tableName}, or the original category-table write failed when this expense was logged. Left in RAW untouched; review manually.`
+    );
   }
 
   return report;
@@ -319,7 +380,7 @@ async function propagate({ driveId, itemId, fromFields, targetTableName, targetR
 function formatSyncReport(report) {
   const lines = [
     `Checked ${report.checked} matched row${report.checked === 1 ? "" : "s"}.`,
-    `→ category: ${report.propagatedToCategory}, → RAW: ${report.propagatedToRaw}, healed: ${report.healed}.`,
+    `→ category: ${report.propagatedToCategory}, → RAW: ${report.propagatedToRaw}, healed: ${report.healed}, deleted from category (mirroring RAW): ${report.deletedFromCategory}.`,
   ];
   if (report.conflicts.length) {
     lines.push(`⚠️ ${report.conflicts.length} conflict(s):`);

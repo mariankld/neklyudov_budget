@@ -190,6 +190,32 @@ async function updateTableRowByIndex(driveId, itemId, tableName, rowIndex, value
   }
 }
 
+/**
+ * Deletes one existing Excel Table row in place by its zero-based data-row index
+ * (`rows/itemAt(index=N)`) — used by the sync job to mirror a deletion made on one side
+ * (RAW or a category table) onto the other side.
+ */
+async function deleteTableRowByIndex(driveId, itemId, tableName, rowIndex) {
+  const token = await getAccessToken();
+  try {
+    await axios.delete(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
+        tableName
+      )}')/rows/itemAt(index=${rowIndex})`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+  } catch (err) {
+    if (err.response && err.response.data) {
+      const graphError = err.response.data.error || err.response.data;
+      err.graphDetail = `[${tableName} delete row ${rowIndex}] ${graphError.code || ''} ${
+        graphError.message || JSON.stringify(graphError)
+      }`.trim();
+      err.message = err.graphDetail;
+    }
+    throw err;
+  }
+}
+
 /** Adds a new column to an existing Excel Table (used by the one-time migration script for RowID/SyncHash). */
 async function addTableColumn(driveId, itemId, tableName, columnName) {
   const token = await getAccessToken();
@@ -298,6 +324,7 @@ module.exports = {
   getTableRows,
   getTableHeaders,
   updateTableRowByIndex,
+  deleteTableRowByIndex,
   addTableColumn,
   createTable,
   renameTable,
