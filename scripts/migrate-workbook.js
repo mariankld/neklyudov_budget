@@ -48,21 +48,20 @@ const INSURANCE_PRE_MIGRATION_WIDTH = 17;
 // Keep in sync with MANUAL_ONLY_CATEGORIES in src/index.js.
 //
 // CreditCards was removed from this list on 2026-08-20 (Mariya wants Credit Cards loggable via
-// Telegram again). The header dump this script produced confirmed CreditCards sits at the exact
-// same 17-column layout as Health/MedInsurance (never got the 2026-08-19 cleanup either) — so it's
-// now registered in INSURANCE_TABLES below and reuses that write branch. buildCategoryRowValues()
-// (src/index.js) and catColsFor() (src/syncJob.js) both already have CreditCards added to their
-// INSURANCE_CATEGORY_TABLES lists, and MANUAL_ONLY_CATEGORIES in src/index.js has been flipped to
-// [] — Credit Cards is now a normal pickable/loggable category like any other.
+// Telegram again). MANUAL_ONLY_CATEGORIES in src/index.js has been flipped to [] — Credit Cards
+// is a normal pickable/loggable category like any other.
 const MANUAL_ONLY_TABLES = [];
 
 // Tables that keep their 5 insurance columns instead of getting the 2026-08-19 cleanup.
 // Keep in sync with INSURANCE_CATEGORY_TABLES in src/index.js and src/syncJob.js.
 //
-// CreditCards added 2026-08-20 — confirmed via this script's own dry-run header dump to be
-// column-for-column identical to Health/MedInsurance's 17-column layout, so it migrates the same
-// way (17 -> 19 after RowID/SyncHash are appended).
-const INSURANCE_TABLES = ["Health", "MedInsurance", "CreditCards"];
+// CreditCards was briefly here too (2026-08-20, when it was column-for-column identical to
+// Health/MedInsurance's 17-column layout and migrated 17 -> 19 the same way). It already has
+// RowID/SyncHash, so this one-time migration script has nothing left to do for it either way —
+// but it no longer belongs in this list: on 2026-08-21 Mariya deleted 4 of its 5 insurance
+// columns by hand, keeping only Карта. Its current 15-column shape lives in index.js's
+// CREDITCARDS_TABLE branch and syncJob.js's CREDITCARDS_CAT_COLS, not here.
+const INSURANCE_TABLES = ["Health", "MedInsurance"];
 
 // Every table the bot writes RowID/SyncHash into: RAW plus every expense category table except
 // the manual-only ones. CATEGORY_TABLE_MAP also carries a non-table property,

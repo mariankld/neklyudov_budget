@@ -86,6 +86,8 @@ Send a photo instead of text (with or without a caption) and the bot reads it th
 
 **Category table (17 columns, expenses only):** Дата, Категория, Описание, Локация, Сумма, Валюта, Курс (blank — Excel formula, exchange-rate lookup), Сумма (HKD) (blank — Excel formula), Примечание, Метод оплаты, Получатель/Сотрудник, Страховка (blank, not tracked by the bot), Статус выплаты (blank), Пользователь, Страховая компания (blank), Период покрытия (blank), Карта (blank).
 
+> This 17-column shape is now the exception, not the rule — see `src/syncJob.js`'s `STANDARD_CAT_COLS` / `INSURANCE_CAT_COLS` / `CREDITCARDS_CAT_COLS` for each table's actual current layout: most tables are the standard 12 columns (+ RowID/SyncHash), Health/MedInsurance kept all 5 insurance columns (19 total), and CreditCards keeps only Карта (15 total).
+
 Category tables' **Категория** column is filled from RAW's **Subcategory** (the specific line item), not RAW's Category — confirmed with Mariya, since it gives more precision inside a tab that's already scoped to one category.
 
 RAW and category-table column orders are independent: `appendTableRow` is called once per table with a values array built specifically for that table's real column order (named-field mapping, not positional copy-paste), so the two never need to line up.

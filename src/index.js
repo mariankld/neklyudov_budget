@@ -63,12 +63,19 @@ const DEFAULT_SUBCATEGORY_BY_CATEGORY = {
 };
 
 /**
+ * Category label that forces the Карта (card) picker instead of the normal payment-method flow
+ * (Mariya, 2026-08-21) — applies to every entry logged under this category, not just subcategory
+ * "Выплата". See keyboardForDraft / buildCardKeyboard / the CREDITCARDS_TABLE branch of
+ * buildCategoryRowValues, where the pick lands in the Карта column and Метод оплаты is left blank.
+ */
+const CREDIT_CARDS_CATEGORY = "Credit Cards";
+
+/**
  * Categories the bot must never log to itself. Credit Cards was removed 2026-08-20: a live
- * header check (node scripts/migrate-workbook.js) confirmed CreditCards is currently a 17-column
- * table with the exact same shape as Health/MedInsurance, so it now shares that write branch
- * (see INSURANCE_CATEGORY_TABLES below) instead of the generic 14-column one — no risk of
- * landing data in the wrong columns. Once RowID/SyncHash are added (migrate-workbook.js --apply),
- * it's a normal pickable category like any other; the sync job also now scans it.
+ * header check (node scripts/migrate-workbook.js) confirmed CreditCards was then a 17-column
+ * table with the exact same shape as Health/MedInsurance. On 2026-08-21 Mariya trimmed
+ * CreditCards down to its own 15-column shape (see CREDITCARDS_TABLE below) — it's still a
+ * normal pickable category like any other; the sync job also still scans it.
  */
 const MANUAL_ONLY_CATEGORIES = [];
 
@@ -83,11 +90,28 @@ const MANUAL_ONLY_CATEGORIES = [];
  * CREDIT_CARD_PAYMENT_METHODS is the ONLY list the Summary!H20 "spent on credit cards" formula
  * matches against (see scripts/fix-h20-credit-card-total.js) — Octopus, WeChat Pay, and any
  * learned custom method are payment methods but never count as a credit card, so they must never
- * be added to this array.
+ * be added to this array. It's also the base option list for the Карта (card) picker forced on
+ * every Credit Cards category entry — see CREDIT_CARDS_CATEGORY / buildCardKeyboard below.
+ *
+ * BASE_PAYMENT_METHODS is the full canonical list (Mariya, 2026-08-21), written out explicitly in
+ * this exact order rather than derived by concatenating CREDIT_CARD_PAYMENT_METHODS with the rest,
+ * since Cash now sits first rather than after the cards.
  */
-const CREDIT_CARD_PAYMENT_METHODS = ["Master SC", "Visa BOC", "Master BEA", "Master Citic"];
-const OTHER_PAYMENT_METHODS = ["Cash", "Bank Transfer", "Octopus", "WeChat Pay"];
-const BASE_PAYMENT_METHODS = [...CREDIT_CARD_PAYMENT_METHODS, ...OTHER_PAYMENT_METHODS];
+const CREDIT_CARD_PAYMENT_METHODS = ["Master SC", "Visa BOC", "Master BEA", "Master Citic", "МИР Сбер"];
+const BASE_PAYMENT_METHODS = [
+  "Cash",
+  "Master SC",
+  "Visa BOC",
+  "Master BEA",
+  "Master Citic",
+  "МИР Сбер",
+  "Bank Transfer",
+  "Octopus",
+  "PayMe",
+  "FPS",
+  "QR code",
+  "WeChat Pay",
+];
 const PAYMENT_METHOD_UNCLEAR = "Unclear";
 /**
  * Written into Payment Method when the user declines to permanently save a genuinely-new method
@@ -189,6 +213,9 @@ const inflightLogPromises = new Map();
 
 /** chatId -> { token } — user clicked Edit and should reply with changes */
 const awaitingEditByChat = new Map();
+
+/** chatId -> { token } — user tapped "Other" on the Карта (card) picker and should reply with the new card name */
+const awaitingCardByChat = new Map();
 
 /** Lowercase alias → exact tab title; from CATEGORY_MAPPING JSON in .env */
 let categoryAliasMap = new Map();
@@ -378,7 +405,46 @@ function buildNewPaymentMethodKeyboard(token, rawPaymentMethod) {
 }
 
 /**
- * Gates the normal Yes/Edit keyboard behind a resolved payment method. Three states:
+ * Options offered by the Карта (card) picker: the known credit cards plus any custom payment
+ * method learned via "Other" (here or on the normal payment-method picker) — a card added through
+ * this picker's "Other" button is stored in the exact same list (see the card: callback handler),
+ * so it immediately reappears here on the next Credit Cards entry AND works as a general payment
+ * method everywhere else, per Mariya (2026-08-21).
+ */
+function getCardOptions() {
+  return [...CREDIT_CARD_PAYMENT_METHODS, ...customPaymentMethods];
+}
+
+/**
+ * Forced picker for the Credit Cards category (Mariya, 2026-08-21): asks which card was paid off
+ * instead of the normal payment-method picker. Always shown for every Credit Cards entry — no
+ * attempt to auto-detect a card from the message first. Same 2-per-row layout and
+ * callback_data-index pattern as buildPaymentMethodKeyboard; "Other" uses the literal suffix
+ * "other" instead of an index since it isn't a pick from the list.
+ */
+function buildCardKeyboard(token) {
+  const cards = getCardOptions();
+  const rows = [];
+  for (let i = 0; i < cards.length; i += 2) {
+    const row = [];
+    for (const idx of [i, i + 1]) {
+      if (idx >= cards.length) continue;
+      const data = `card:${token}:${idx}`;
+      assertCallbackDataLength(data);
+      row.push({ text: cards[idx], callback_data: data });
+    }
+    rows.push(row);
+  }
+  const otherData = `card:${token}:other`;
+  assertCallbackDataLength(otherData);
+  rows.push([{ text: "➕ Other (add new card)", callback_data: otherData }]);
+  return { inline_keyboard: rows };
+}
+
+/**
+ * Gates the normal Yes/Edit keyboard behind a resolved payment method (or, for Credit Cards, a
+ * resolved card). Credit Cards is checked first and short-circuits everything else — paymentMethod
+ * is ignored entirely for this category, per Mariya (2026-08-21). Otherwise, three states:
  *   1. paymentMethod already resolved -> buildConfirmKeyboard.
  *   2. paymentMethod unclear but paymentMethodRaw names something genuinely new (not a known
  *      method under any casing) -> buildNewPaymentMethodKeyboard, offering to learn it.
@@ -386,6 +452,9 @@ function buildNewPaymentMethodKeyboard(token, rawPaymentMethod) {
  *      method) -> buildPaymentMethodKeyboard, the plain picker.
  */
 function keyboardForDraft(token, draft) {
+  if (draft.category === CREDIT_CARDS_CATEGORY) {
+    return draft.card ? buildConfirmKeyboard(token) : buildCardKeyboard(token);
+  }
   if (draft.paymentMethod !== PAYMENT_METHOD_UNCLEAR) {
     return buildConfirmKeyboard(token);
   }
@@ -802,6 +871,13 @@ function normalizeDraft(result, messageDate) {
     recipient: String(result.recipient || "").trim(),
     /** dd/mm/yyyy — from the receipt/message/edit when present, else the Telegram message time. */
     dateDdMmYyyy: formatDateDdMmYyyy(effectiveDate),
+    /**
+     * Which credit card was paid off — only meaningful for CREDIT_CARDS_CATEGORY, picked via the
+     * forced Карта button picker (never parsed by OpenAI, never guessed). Always starts blank;
+     * callers that need to carry a previously-picked card across an edit must copy it forward
+     * explicitly (see processEditInstruction) since this function has no memory of prior drafts.
+     */
+    card: "",
   };
 
   if (!Number.isFinite(normalized.amount) || normalized.amount <= 0) {
@@ -855,6 +931,22 @@ function formatDraftPreview(draft, categorySheetName) {
       ? `\nNotes: ${draft.notes}`
       : "\nNotes: —";
 
+  /**
+   * Credit Cards rows never show/ask for Payment method (the forced Карта picker replaces that
+   * flow entirely — see keyboardForDraft) — a "Card" line is shown instead, mirroring the same
+   * "not yet chosen — pick below" wording pattern. Mariya, 2026-08-21.
+   */
+  const paymentOrCardLine =
+    categorySheetName === CREDIT_CARDS_CATEGORY
+      ? `Card: ${draft.card ? draft.card : "⚠️ Not yet chosen — please pick below"}`
+      : `Payment method: ${
+          draft.paymentMethod === PAYMENT_METHOD_UNCLEAR || !draft.paymentMethod
+            ? draft.paymentMethodRaw && !findKnownPaymentMethod(draft.paymentMethodRaw)
+              ? `⚠️ New payment method detected: "${draft.paymentMethodRaw}" — save it? (see buttons below)`
+              : "⚠️ Not yet chosen — please pick below"
+            : draft.paymentMethod
+        }`;
+
   return [
     "I will log this as:",
     "",
@@ -867,13 +959,7 @@ function formatDraftPreview(draft, categorySheetName) {
     `Sum: ${draft.amount}`,
     `Currency: ${draft.currency}`,
     "Sum (HKD): (calculated automatically from that day's exchange rate)",
-    `Payment method: ${
-      draft.paymentMethod === PAYMENT_METHOD_UNCLEAR || !draft.paymentMethod
-        ? draft.paymentMethodRaw && !findKnownPaymentMethod(draft.paymentMethodRaw)
-          ? `⚠️ New payment method detected: "${draft.paymentMethodRaw}" — save it? (see buttons below)`
-          : "⚠️ Not yet chosen — please pick below"
-        : draft.paymentMethod
-    }`,
+    paymentOrCardLine,
     `Recipient: ${draft.recipient && draft.recipient.length ? draft.recipient : "—"}`,
     `Logged by: ${draft.sender || "Unknown"}`,
     notesLine,
@@ -884,6 +970,14 @@ function formatDraftPreview(draft, categorySheetName) {
 
 function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
   const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
+  /**
+   * Credit Cards rows never get a user-confirmed Payment Method (the forced Карта picker replaces
+   * that flow entirely — see keyboardForDraft), so whatever OpenAI guessed at parse time was never
+   * reviewed by anyone. Left blank here too rather than writing an unconfirmed guess, mirroring the
+   * category table's own Метод оплаты column (Mariya, 2026-08-21).
+   */
+  const paymentMethodCell =
+    categorySheetName === CREDIT_CARDS_CATEGORY ? "" : draft.paymentMethod || PAYMENT_METHOD_UNCLEAR;
 
   return [
     draft.dateDdMmYyyy,
@@ -897,7 +991,7 @@ function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
     sumHkd,
     notesCell,
     draft.sender || "Unknown",
-    draft.paymentMethod || PAYMENT_METHOD_UNCLEAR,
+    paymentMethodCell,
     rowId || "",
     syncHash || "",
   ];
@@ -935,20 +1029,47 @@ function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
  * Keep in sync with scripts/migrate-workbook.js's INSURANCE_TABLES and syncJob.js's per-table
  * column maps — all three must agree on which tables keep the insurance columns.
  *
- * CreditCards added 2026-08-20: `node scripts/migrate-workbook.js` (dry run) confirmed the live
- * CreditCards table is currently sitting at the exact same 17-column layout as Health/
- * MedInsurance (Дата, Категория, Описание, Локация, Сумма, Валюта, Курс, Сумма (HKD),
- * Примечание, Метод оплаты, Получатель/Сотрудник, Страховка, Статус выплаты, Пользователь,
- * Страховая компания, Период покрытия, Карта) — it never got the 2026-08-19 cleanup either.
- * Nothing to do with insurance, it just happens to match column-for-column, so it reuses this
- * same branch/write shape. Summary!H21 filters CreditCards[Категория] (= Subcategory here, same
- * as everywhere else) for "*Выплата*" — log credit card debt repayments with subcategory
- * "Выплата" so that formula keeps picking them up.
+ * CreditCards was added here 2026-08-20 (same 17-column layout as Health/MedInsurance at the
+ * time) but on 2026-08-21 Mariya deleted 4 of its 5 insurance columns by hand (Страховка,
+ * Статус выплаты, Страховая компания, Период покрытия), keeping only Карта — so CreditCards no
+ * longer belongs in this branch. It now has its own shape below (CREDITCARDS_TABLE). Summary!H21
+ * filters CreditCards[Категория] (= Subcategory here, same as everywhere else) for "*Выплата*" —
+ * log credit card debt repayments with subcategory "Выплата" so that formula keeps picking them
+ * up.
  */
-const INSURANCE_CATEGORY_TABLES = ["Health", "MedInsurance", "CreditCards"];
+const INSURANCE_CATEGORY_TABLES = ["Health", "MedInsurance"];
+
+/**
+ * CreditCards (2026-08-21): Mariya removed 4 of the 5 old insurance columns by hand (Страховка,
+ * Статус выплаты, Страховая компания, Период покрытия), keeping Карта — so this table is now the
+ * standard 12-column layout plus a single extra Карта column before RowID/SyncHash (15 total).
+ * Keep in sync with src/syncJob.js's CREDITCARDS_CAT_COLS.
+ */
+const CREDITCARDS_TABLE = "CreditCards";
 
 function buildCategoryRowValues(draft, rate, sumHkd, rowId, syncHash, tableName) {
   const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
+
+  if (tableName === CREDITCARDS_TABLE) {
+    return [
+      draft.dateDdMmYyyy, // Дата
+      draft.subcategory, // Категория
+      draft.description, // Описание
+      draft.location, // Локация
+      draft.amount, // Сумма
+      draft.currency, // Валюта
+      rate, // Курс
+      sumHkd, // Сумма (HKD)
+      notesCell, // Примечание
+      "", // Метод оплаты — always left blank for Credit Cards rows (Mariya, 2026-08-21); the card
+      //     paid off is collected instead, via the forced Карта picker, and lands in the column below.
+      draft.recipient || "", // Получатель/Сотрудник
+      draft.sender || "Unknown", // Пользователь
+      draft.card || "", // Карта — chosen via the forced button picker; see keyboardForDraft/buildCardKeyboard
+      rowId || "", // RowID
+      syncHash || "", // SyncHash
+    ];
+  }
 
   if (INSURANCE_CATEGORY_TABLES.includes(tableName)) {
     // Old, pre-insurance-cleanup 17-column layout, preserved on purpose for this table, plus
@@ -1370,6 +1491,7 @@ async function presentDraftForConfirmation(parsed, context) {
 
 async function processExpenseFlow(chatId, originalMessage, sender, messageId, messageDate, messageThreadId) {
   awaitingEditByChat.delete(chatId);
+  awaitingCardByChat.delete(chatId);
   const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
   await sendTelegramMessage(chatId, "⏳ Analyzing your message...", messageId, undefined, threadExtras);
 
@@ -1387,6 +1509,7 @@ async function processExpenseFlow(chatId, originalMessage, sender, messageId, me
 
 async function processImageExpenseFlow(chatId, fileId, captionText, sender, messageId, messageDate, messageThreadId) {
   awaitingEditByChat.delete(chatId);
+  awaitingCardByChat.delete(chatId);
   const threadExtras = messageThreadId != null ? { message_thread_id: messageThreadId } : {};
   await sendTelegramMessage(chatId, "⏳ Reading your photo...", messageId, undefined, threadExtras);
 
@@ -1460,6 +1583,16 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
     preservePaymentMethodUnlessEdited(parsed, editText, entry.draft);
     const draft = normalizeDraft(parsed, entry.messageDate);
     draft.sender = entry.sender || "Unknown";
+    /**
+     * normalizeDraft always starts card blank (OpenAI never sees/edits it — see its own comment).
+     * Carry the previously-picked card forward as long as the category is still Credit Cards, so
+     * an unrelated edit (e.g. "amount 500") doesn't re-trigger the Карта picker. If the category
+     * changed away from or into Credit Cards, leaving it blank is correct: it's irrelevant when
+     * leaving, and the picker must still be forced the first time when entering.
+     */
+    if (entry.draft.category === CREDIT_CARDS_CATEGORY && draft.category === CREDIT_CARDS_CATEGORY) {
+      draft.card = entry.draft.card || "";
+    }
     const categorySheetName = draft.category;
 
     pendingByToken.delete(wait.token);
@@ -1596,6 +1729,7 @@ async function handleCallbackQuery(callbackQuery) {
           );
         }
         awaitingEditByChat.delete(chatId);
+        awaitingCardByChat.delete(chatId);
         return { ok: true };
       } catch (err) {
         console.error("Log callback error:", err.message);
@@ -1658,6 +1792,7 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     awaitingEditByChat.set(chatId, { token });
+    awaitingCardByChat.delete(chatId);
     const editThreadExtras =
       entry.messageThreadId != null
         ? { message_thread_id: entry.messageThreadId }
@@ -1766,7 +1901,122 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  const cardPrefix = "card:";
+  if (data.startsWith(cardPrefix)) {
+    const rest = data.slice(cardPrefix.length);
+    const sepIdx = rest.lastIndexOf(":");
+    const token = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const choice = sepIdx === -1 ? "" : rest.slice(sepIdx + 1);
+
+    prunePending();
+    const entry = pendingByToken.get(token);
+    if (!entry) {
+      await tell(
+        "⚠️ This confirmation is not on this server anymore. Send the expense again. With multiple replicas, use only one instance."
+      );
+      return;
+    }
+    if (entry.chatId !== chatId) {
+      await tell("Not allowed.");
+      return;
+    }
+
+    const cardThreadExtras =
+      entry.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : callbackExtras;
+
+    if (choice === "other") {
+      awaitingCardByChat.set(chatId, { token });
+      await sendTelegramMessage(
+        chatId,
+        "💳 Type the name of the card. It'll be added to the card list and to payment methods.",
+        messageId,
+        undefined,
+        cardThreadExtras
+      );
+      return;
+    }
+
+    const cards = getCardOptions();
+    const idx = Number(choice);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= cards.length) {
+      await tell("⚠️ Unrecognized card option — send the expense again.");
+      return;
+    }
+
+    entry.draft.card = cards[idx];
+
+    const preview = formatDraftPreview(entry.draft, entry.draft.category);
+    const keyboard = buildConfirmKeyboard(token);
+
+    try {
+      await editTelegramMessage(chatId, messageId, preview, keyboard, cardThreadExtras);
+    } catch (e) {
+      console.error("editTelegramMessage (card select):", e.message);
+      await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard, cardThreadExtras);
+    }
+    return;
+  }
+
   await tell("Unknown button.");
+}
+
+/**
+ * Handles a free-text reply after the user tapped "Other" on the Карта (card) picker — mirrors
+ * processEditInstruction's awaiting-reply pattern. The typed name is learned via
+ * addCustomPaymentMethod (same store as a new general payment method — see getCardOptions), then
+ * written straight into the draft's card field and the confirm keyboard is shown.
+ */
+async function processCardNameReply(chatId, cardNameText, messageId, messageThreadId) {
+  const wait = awaitingCardByChat.get(chatId);
+  if (!wait) {
+    return false;
+  }
+
+  const entry = pendingByToken.get(wait.token);
+  const threadExtras =
+    messageThreadId != null
+      ? { message_thread_id: messageThreadId }
+      : entry?.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : {};
+
+  if (!entry) {
+    awaitingCardByChat.delete(chatId);
+    await sendTelegramMessage(
+      chatId,
+      "That card-selection session expired. Send the expense again.",
+      messageId,
+      undefined,
+      threadExtras
+    );
+    return true;
+  }
+
+  const clean = String(cardNameText || "").trim();
+  if (!clean) {
+    await sendTelegramMessage(
+      chatId,
+      "Card name can't be empty — type a name, or send /cancel.",
+      messageId,
+      undefined,
+      threadExtras
+    );
+    return true;
+  }
+
+  // Reuses the existing custom-payment-methods store (Mariya, 2026-08-21): a card added here is
+  // immediately usable both as a future Карта option (getCardOptions) and as a general payment
+  // method everywhere else (getPaymentMethods) — one shared list, not a separate card-only list.
+  const saved = addCustomPaymentMethod(clean);
+  entry.draft.card = saved || clean;
+  awaitingCardByChat.delete(chatId);
+
+  const preview = formatDraftPreview(entry.draft, entry.draft.category);
+  const keyboard = buildConfirmKeyboard(wait.token);
+  await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard, threadExtras);
+  return true;
 }
 
 app.post("/webhook/telegram", async (req, res) => {
@@ -1819,6 +2069,7 @@ app.post("/webhook/telegram", async (req, res) => {
 
     if (isStartCommand(originalMessage)) {
       awaitingEditByChat.delete(chatId);
+      awaitingCardByChat.delete(chatId);
       try {
         await sendTelegramMessage(chatId, getWelcomeMessage(), messageId, undefined, threadExtras);
       } catch (err) {
@@ -1829,6 +2080,7 @@ app.post("/webhook/telegram", async (req, res) => {
 
     if (isCancelCommand(originalMessage)) {
       awaitingEditByChat.delete(chatId);
+      awaitingCardByChat.delete(chatId);
       try {
         await sendTelegramMessage(
           chatId,
@@ -1873,6 +2125,7 @@ app.post("/webhook/telegram", async (req, res) => {
       if (imageInput) {
         /** A photo always starts a fresh draft; it is never treated as a reply to a pending edit. */
         awaitingEditByChat.delete(chatId);
+        awaitingCardByChat.delete(chatId);
         await processImageExpenseFlow(
           chatId,
           imageInput.fileId,
@@ -1883,6 +2136,18 @@ app.post("/webhook/telegram", async (req, res) => {
           messageThreadId
         );
         return ok();
+      }
+
+      if (awaitingCardByChat.has(chatId)) {
+        const handled = await processCardNameReply(
+          chatId,
+          originalMessage.trim(),
+          messageId,
+          messageThreadId
+        );
+        if (handled) {
+          return ok();
+        }
       }
 
       if (awaitingEditByChat.has(chatId)) {

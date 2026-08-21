@@ -90,13 +90,13 @@ const STANDARD_CAT_COLS = {
  * sync with index.js's buildCategoryRowValues (INSURANCE_CATEGORY_TABLES) and
  * scripts/migrate-workbook.js (INSURANCE_TABLES) — all three must agree.
  *
- * CreditCards was added here 2026-08-20 too, once Mariya confirmed she wants Credit Cards
- * loggable again: a live header check (scripts/migrate-workbook.js) showed CreditCards is
- * currently sitting at the exact same 17-column layout as Health/MedInsurance (it also never got
- * the 2026-08-19 cleanup) — nothing to do with insurance, it just happens to share the identical
- * column positions, so it safely reuses INSURANCE_CAT_COLS rather than needing a third map.
+ * CreditCards was added here 2026-08-20 too, sharing this same 17-column shape at the time. On
+ * 2026-08-21 Mariya deleted 4 of its 5 insurance columns by hand (Страховка, Статус выплаты,
+ * Страховая компания, Период покрытия), keeping only Карта — so CreditCards no longer fits this
+ * map and now has its own CREDITCARDS_CAT_COLS below. Keep index.js's CREDITCARDS_TABLE branch,
+ * this file's CREDITCARDS_CAT_COLS, and catColsFor() all in sync.
  */
-const INSURANCE_CATEGORY_TABLES = ["Health", "MedInsurance", "CreditCards"];
+const INSURANCE_CATEGORY_TABLES = ["Health", "MedInsurance"];
 const INSURANCE_CAT_COLS = {
   date: 0,
   subcategory: 1, // Категория
@@ -116,8 +116,32 @@ const INSURANCE_CAT_COLS = {
   syncHash: 18,
 };
 
+/**
+ * CreditCards (2026-08-21): standard 12-column layout plus one extra Карта column before
+ * RowID/SyncHash (15 total) — see index.js's CREDITCARDS_TABLE branch in buildCategoryRowValues.
+ */
+const CREDITCARDS_TABLE = "CreditCards";
+const CREDITCARDS_CAT_COLS = {
+  date: 0,
+  subcategory: 1, // Категория
+  description: 2, // Описание
+  location: 3, // Локация
+  amount: 4, // Сумма
+  currency: 5, // Валюта
+  rate: 6, // Курс
+  sumHkd: 7, // Сумма (HKD)
+  notes: 8, // Примечание
+  paymentMethod: 9, // Метод оплаты
+  recipient: 10, // Получатель/Сотрудник
+  sender: 11, // Пользователь
+  // 12 Карта — not collected via Telegram, never touched by the sync job
+  rowId: 13,
+  syncHash: 14,
+};
+
 /** Picks the right column map for a given category Excel Table name. */
 function catColsFor(tableName) {
+  if (tableName === CREDITCARDS_TABLE) return CREDITCARDS_CAT_COLS;
   return INSURANCE_CATEGORY_TABLES.includes(tableName) ? INSURANCE_CAT_COLS : STANDARD_CAT_COLS;
 }
 
@@ -526,5 +550,7 @@ module.exports = {
   STANDARD_CAT_COLS,
   INSURANCE_CAT_COLS,
   INSURANCE_CATEGORY_TABLES,
+  CREDITCARDS_CAT_COLS,
+  CREDITCARDS_TABLE,
   catColsFor,
 };
