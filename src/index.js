@@ -563,6 +563,30 @@ function applyDeterministicRelativeDate(parsed, text, messageDate) {
   }
 }
 
+const PAYMENT_METHOD_EDIT_KEYWORDS =
+  /\b(pay|paid|payment|card|cash|method|visa|mastercard|octopus|wechat|alipay|payme|bank|transfer|cheque|check)\b/i;
+
+/**
+ * Bug fix (2026-08-21): an edit to an unrelated field (e.g. "this expense is from yesterday")
+ * could silently flip paymentMethod/paymentMethodRaw back to unresolved, re-triggering the "new
+ * payment method — save it?" prompt even after the user had already answered it (e.g. chosen
+ * "No, log as Unfamiliar Payment Method"). Root cause: paymentMethodRaw was never sent to the
+ * edit model, and the "keep paymentMethod unchanged" instruction in buildEditPrompt is only a
+ * soft-language instruction — the model would re-derive paymentMethodRaw from originalMessage
+ * (which still contains the payment wording) and could drift paymentMethod back to
+ * PAYMENT_METHOD_UNCLEAR. Mirrors applyDeterministicRelativeDate: if the edit instruction itself
+ * says nothing about how the expense was paid, force-copy the already-resolved payment fields
+ * forward instead of trusting the model to leave them alone. Only an edit that actually mentions
+ * payment/card/cash/method (etc.) is allowed to change them.
+ */
+function preservePaymentMethodUnlessEdited(parsed, editText, previousDraft) {
+  if (!parsed || !previousDraft) return;
+  const mentionsPayment = typeof editText === "string" && PAYMENT_METHOD_EDIT_KEYWORDS.test(editText);
+  if (mentionsPayment) return;
+  parsed.paymentMethod = previousDraft.paymentMethod;
+  parsed.paymentMethodRaw = previousDraft.paymentMethodRaw;
+}
+
 function buildAnalysisPrompt(messageText, contextDateLabel) {
   const categoryList = allowedCategories.join(", ");
   return [
@@ -592,7 +616,7 @@ function buildEditPrompt(currentDraft, editInstruction, originalMessage, context
   return [
     `The real-world date context for this edit is ${contextDateLabel} — use this exact date as "today" for resolving any relative date in the edit instruction. Never substitute a different notion of today.`,
     "Apply the user's edit instructions to this draft. Keep other fields unchanged unless the edit implies them.",
-    `This includes paymentMethod: keep its current value unless the edit instruction explicitly changes the payment method — this is true even if the current value is "${PAYMENT_METHOD_UNCLEAR}" or "${PAYMENT_METHOD_UNFAMILIAR}"; those are valid values to copy forward unchanged too, not just the list below. paymentMethod MUST be exactly one of these strings — no other value is valid: ${getPaymentMethods().map((m) => `"${m}"`).join(", ")}, "${PAYMENT_METHOD_UNCLEAR}", "${PAYMENT_METHOD_UNFAMILIAR}". If the edit instruction requests a payment method that doesn't clearly match one of the named methods, use "${PAYMENT_METHOD_UNCLEAR}" instead of inventing a new value.`,
+    `This includes paymentMethod AND paymentMethodRaw: keep both at their current value unless the edit instruction explicitly changes the payment method — this is true even if the current paymentMethod is "${PAYMENT_METHOD_UNCLEAR}" or "${PAYMENT_METHOD_UNFAMILIAR}"; those are valid values to copy forward unchanged too, not just the list below. Do NOT re-derive paymentMethod or paymentMethodRaw from the original message just because it's shown below — that field has already been resolved (possibly by the user explicitly declining to save a new payment method) and must not be recomputed on an unrelated edit. paymentMethod MUST be exactly one of these strings — no other value is valid: ${getPaymentMethods().map((m) => `"${m}"`).join(", ")}, "${PAYMENT_METHOD_UNCLEAR}", "${PAYMENT_METHOD_UNFAMILIAR}". If the edit instruction requests a payment method that doesn't clearly match one of the named methods, use "${PAYMENT_METHOD_UNCLEAR}" instead of inventing a new value.`,
     `This also includes date (currently dd/mm/yyyy in the draft): keep it unchanged unless the edit instruction explicitly gives a new date, e.g. "date to 15/03/2026", "change date to yesterday", "it was actually last Friday" — resolve relative dates strictly relative to ${contextDateLabel} (the context date above), never relative to any other date. Always output date as dd/mm/yyyy, never null, when editing an existing draft.`,
     `Allowed categories: ${categoryList}. Never use "${RAW_SHEET}" as category name.`,
     "",
@@ -1424,6 +1448,7 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
     currency: entry.draft.currency,
     notes: entry.draft.notes,
     paymentMethod: entry.draft.paymentMethod,
+    paymentMethodRaw: entry.draft.paymentMethodRaw,
     recipient: entry.draft.recipient,
     date: entry.draft.dateDdMmYyyy,
   };
@@ -1432,6 +1457,7 @@ async function processEditInstruction(chatId, editText, messageId, messageThread
     await sendTelegramMessage(chatId, "⏳ Updating your draft...", messageId, undefined, threadExtras);
     const parsed = await parseEditWithOpenAI(flatDraft, editText, entry.originalMessage, entry.messageDate);
     applyDeterministicRelativeDate(parsed, editText, entry.messageDate);
+    preservePaymentMethodUnlessEdited(parsed, editText, entry.draft);
     const draft = normalizeDraft(parsed, entry.messageDate);
     draft.sender = entry.sender || "Unknown";
     const categorySheetName = draft.category;
