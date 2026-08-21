@@ -49,6 +49,20 @@ const CATEGORY_TABLE_MAP = {
 };
 
 /**
+ * Per-category default subcategory (Mariya, 2026-08-21): most CreditCards rows are debt
+ * repayments, and Summary!H21 only picks up CreditCards rows whose Категория/subcategory
+ * contains "Выплата" (see INSURANCE_CATEGORY_TABLES comment above buildCategoryRowValues).
+ * Rather than requiring the subcategory to be typed/corrected on every single credit-card
+ * message, "Выплата" is applied automatically whenever OpenAI doesn't extract a subcategory
+ * of its own — see normalizeDraft(). It's still a normal draft field: the user can override it
+ * for a given transaction either in the original message (e.g. "credit card interest fee, 200
+ * HKD") or afterwards via the chat edit flow (e.g. "change subcategory to Fee").
+ */
+const DEFAULT_SUBCATEGORY_BY_CATEGORY = {
+  "Credit Cards": "Выплата",
+};
+
+/**
  * Categories the bot must never log to itself. Credit Cards was removed 2026-08-20: a live
  * header check (node scripts/migrate-workbook.js) confirmed CreditCards is currently a 17-column
  * table with the exact same shape as Health/MedInsurance, so it now shares that write branch
@@ -560,7 +574,7 @@ function buildAnalysisPrompt(messageText, contextDateLabel) {
     "Fill fields as follows:",
     "- amount: primary numeric sum from the message.",
     "- description: short label; you may use the user's wording.",
-    `- subcategory: specific line item (e.g. Transport → Highway toll).`,
+    `- subcategory: specific line item (e.g. Transport → Highway toll). Exception: if category is "Credit Cards", default subcategory to "Выплата" (most Credit Cards entries are card debt repayments) unless the message clearly describes something else (e.g. an interest charge, annual fee, or refund) — in that case use that instead.`,
     `- location: default "${DEFAULT_LOCATION}" unless the message states another place.`,
     `- currency: default "${DEFAULT_CURRENCY}" unless the message states another currency.`,
     `- notes: empty string unless the user explicitly adds an extra note beyond amount/description; do not duplicate the description.`,
@@ -672,7 +686,7 @@ function buildImageAnalysisPrompt(captionText, contextDateLabel) {
     "- amount: the primary total amount charged or paid, as shown in the image. Look carefully, even if the text is small, blurry, or partially compressed, and report your best-effort reading of that amount.",
     "- Only set amount to 0 if there is truly no numeric amount visible anywhere in the image. Never guess or invent a number, and never default to 0 just because the text is slightly hard to read—read it as carefully as you can first.",
     "- description: merchant or payee name, or a short label for what the image shows.",
-    "- subcategory: a specific line item if visible (e.g. Transport → Highway toll).",
+    `- subcategory: a specific line item if visible (e.g. Transport → Highway toll). Exception: if category is "Credit Cards", default subcategory to "Выплата" (most Credit Cards entries are card debt repayments) unless the image/caption clearly shows something else (e.g. an interest charge, annual fee, or refund) — in that case use that instead.`,
     `- location: default "${DEFAULT_LOCATION}" unless the image or caption states another place.`,
     `- currency: default "${DEFAULT_CURRENCY}" unless the image clearly shows another currency symbol or code.`,
     "- notes: empty string unless there is a clear extra detail worth keeping (e.g. last 4 card digits, transaction id); do not duplicate the description.",
@@ -776,6 +790,17 @@ function normalizeDraft(result, messageDate) {
     throw new Error(`Unsupported type: ${normalized.type}`);
   } else {
     normalized.category = resolveCategoryToSheet(normalized.category, allowedCategories);
+  }
+
+  /**
+   * Apply the per-category default subcategory (currently just Credit Cards -> "Выплата") only
+   * when OpenAI didn't extract one of its own — so a message or edit instruction that specifies
+   * a subcategory always wins, and this only fills the common case of a plain credit-card
+   * payment. Runs after category resolution so it also fires when a synonym/alias resolved to
+   * "Credit Cards".
+   */
+  if (!normalized.subcategory && DEFAULT_SUBCATEGORY_BY_CATEGORY[normalized.category]) {
+    normalized.subcategory = DEFAULT_SUBCATEGORY_BY_CATEGORY[normalized.category];
   }
 
   return normalized;
@@ -1070,6 +1095,8 @@ function getWelcomeMessage() {
     "",
     "If you're editing and change your mind, send /cancel.",
     "",
+    "Just want to leave a comment without logging anything? Start your message with /ignore, e.g. \"/ignore already reimbursed by roommate\".",
+    "",
     "RAW and the category tabs sync automatically every day. If you edited a row directly in Excel and want it reflected right away, send /sync.",
   ].join("\n");
 }
@@ -1202,6 +1229,19 @@ async function bootstrap() {
 function isCancelCommand(text) {
   const t = (text || "").trim();
   return t === "/cancel" || t.startsWith("/cancel ");
+}
+
+/**
+ * /ignore (Mariya, 2026-08-21): lets you send a plain comment about a payment in the chat
+ * — e.g. "/ignore already reimbursed by roommate" — without the bot trying to parse it as a
+ * new expense/income. Matched before any OpenAI call so an /ignore'd message never costs a
+ * parse and never produces a draft. Deliberately does NOT touch awaitingEditByChat: if you were
+ * mid-edit on a pending draft, an /ignore'd aside shouldn't cancel that edit (use /cancel for
+ * that) — it just skips itself.
+ */
+function isIgnoreCommand(text) {
+  const t = (text || "").trim();
+  return t === "/ignore" || t.startsWith("/ignore ");
 }
 
 function isSyncCommand(text) {
@@ -1774,6 +1814,12 @@ app.post("/webhook/telegram", async (req, res) => {
       } catch (err) {
         console.error("Telegram send error:", err.message);
       }
+      return ok();
+    }
+
+    if (isIgnoreCommand(originalMessage)) {
+      // No reply on purpose (Mariya, 2026-08-21) — /ignore is meant to be a silent no-op so a
+      // string of comments doesn't clutter the chat with acknowledgements.
       return ok();
     }
 
