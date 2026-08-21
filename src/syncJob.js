@@ -56,12 +56,13 @@ const RAW_COLS = {
   location: 5,
   amount: 6,
   currency: 7,
-  sumHkd: 8,
-  notes: 9,
-  sender: 10,
-  paymentMethod: 11,
-  rowId: 12,
-  syncHash: 13,
+  rate: 8, // Exchange Rate — added 2026-08-21, frozen to this row's own Date/Currency
+  sumHkd: 9,
+  notes: 10,
+  sender: 11,
+  paymentMethod: 12,
+  rowId: 13,
+  syncHash: 14,
 };
 
 // Standard 14-column layout — every category table except Health/MedInsurance (see below).
@@ -157,6 +158,7 @@ const RAW_COL_DISPLAY_NAMES = {
   location: "Location",
   amount: "Amount",
   currency: "Currency",
+  rate: "Exchange Rate",
   sumHkd: "Sum (HKD)",
   notes: "Notes",
   paymentMethod: "Payment Method",
@@ -344,7 +346,7 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
 
       try {
         if (rawChanged) {
-          const { sumHkd, writtenFields } = await propagate({
+          const { rate, sumHkd, writtenFields } = await propagate({
             driveId,
             itemId,
             fromFields: rawFields,
@@ -359,13 +361,14 @@ async function runSync({ driveId, itemId, rawSheetName, categoryTableMap }) {
           const healedRaw = [...rawEntry.row];
           healedRaw[RAW_COLS.syncHash] = newHash;
           // RAW is the source of truth here (it's what changed), but RAW also carries its own
-          // computed Sum (HKD) column (RAW_COLS.sumHkd) that must stay in step with whatever
+          // computed Exchange Rate / Sum (HKD) columns that must stay in step with whatever
           // amount/currency/rate propagate() just used for the category row — otherwise RAW's
-          // own Sum (HKD) goes stale forever after any RAW-side edit. Reuse the exact sumHkd
+          // own copies go stale forever after any RAW-side edit. Reuse the exact rate/sumHkd
           // propagate() just computed (and wrote into the category row) instead of recomputing
-          // it a second time, so RAW and the category row can never disagree even if the FX
+          // them a second time, so RAW and the category row can never disagree even if the FX
           // rate happened to change between two separate lookups.
-          const rawChangedCols = diffColumns(rawEntry.row, { sumHkd }, RAW_COLS, RAW_COL_DISPLAY_NAMES);
+          const rawChangedCols = diffColumns(rawEntry.row, { rate, sumHkd }, RAW_COLS, RAW_COL_DISPLAY_NAMES);
+          healedRaw[RAW_COLS.rate] = rate;
           healedRaw[RAW_COLS.sumHkd] = sumHkd;
           await updateTableRowByIndex(driveId, itemId, rawSheetName, rawEntry.idx, healedRaw);
           report.propagatedToCategory++;
@@ -473,6 +476,7 @@ async function propagate({ driveId, itemId, fromFields, targetTableName, targetR
     updated[RAW_COLS.location] = fromFields.location;
     updated[RAW_COLS.amount] = fromFields.amount;
     updated[RAW_COLS.currency] = fromFields.currency;
+    updated[RAW_COLS.rate] = rate;
     updated[RAW_COLS.sumHkd] = sumHkd;
     updated[RAW_COLS.notes] = fromFields.notes;
     updated[RAW_COLS.paymentMethod] = fromFields.paymentMethod;
@@ -483,6 +487,7 @@ async function propagate({ driveId, itemId, fromFields, targetTableName, targetR
       location: fromFields.location,
       amount: fromFields.amount,
       currency: fromFields.currency,
+      rate,
       sumHkd,
       notes: fromFields.notes,
       paymentMethod: fromFields.paymentMethod,

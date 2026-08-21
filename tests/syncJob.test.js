@@ -107,7 +107,7 @@ function mergeableFields({ date, description, location, amount, currency, notes,
   return { date, description, location, amount: Number(amount), currency, notes, paymentMethod, subcategory };
 }
 
-function rawRow({ date, subcategory, description, location, amount, currency, sumHkd, notes = "", sender = "Mariya", paymentMethod = "PayMe", rowId = "rid1", syncHash }) {
+function rawRow({ date, subcategory, description, location, amount, currency, rate = "", sumHkd, notes = "", sender = "Mariya", paymentMethod = "PayMe", rowId = "rid1", syncHash }) {
   const row = [];
   row[RAW_COLS.date] = date;
   row[RAW_COLS.type] = "Expense";
@@ -117,6 +117,7 @@ function rawRow({ date, subcategory, description, location, amount, currency, su
   row[RAW_COLS.location] = location;
   row[RAW_COLS.amount] = amount;
   row[RAW_COLS.currency] = currency;
+  row[RAW_COLS.rate] = rate;
   row[RAW_COLS.sumHkd] = sumHkd;
   row[RAW_COLS.notes] = notes;
   row[RAW_COLS.sender] = sender;
@@ -176,7 +177,7 @@ test("rawChanged: propagates to category row AND rewrites RAW's own Sum (HKD)", 
 
   resetWorkbook({
     RAW: [
-      rawRow({ date: "10/08/2026", subcategory: "Dinner", description: "Dinner", location: "Hong Kong", amount: 200 /* edited on RAW */, currency: "USD", sumHkd: 780 /* stale — 100*7.8 */, syncHash: hash0 }),
+      rawRow({ date: "10/08/2026", subcategory: "Dinner", description: "Dinner", location: "Hong Kong", amount: 200 /* edited on RAW */, currency: "USD", rate: 7.8 /* unchanged — same date/currency */, sumHkd: 780 /* stale — 100*7.8 */, syncHash: hash0 }),
     ],
     Restaurants: [
       catRow({ date: "10/08/2026", subcategory: "Dinner", description: "Dinner", location: "Hong Kong", amount: 100 /* unchanged */, currency: "USD", rate: 7.8, sumHkd: 780, syncHash: hash0 }),
@@ -199,6 +200,7 @@ test("rawChanged: propagates to category row AND rewrites RAW's own Sum (HKD)", 
   // The actual regression: RAW's OWN Sum (HKD) must also be rewritten to 1560, not left at the
   // stale 780 with only SyncHash healed.
   assert.strictEqual(newRaw[RAW_COLS.sumHkd], 1560, "RAW's own Sum (HKD) must be recomputed, not left stale");
+  assert.strictEqual(newRaw[RAW_COLS.rate], 7.8, "RAW's own Exchange Rate should stay 7.8 (same date/currency, no change)");
   assert.strictEqual(newRaw[RAW_COLS.syncHash], newCat[RAW_COLS.syncHash] === undefined ? newRaw[RAW_COLS.syncHash] : newRaw[RAW_COLS.syncHash], "sanity");
   assert.notStrictEqual(newRaw[RAW_COLS.syncHash], hash0, "RAW's SyncHash must be healed to the new hash");
 });
@@ -222,7 +224,7 @@ test("catChanged: propagates to RAW, including RAW's Sum (HKD)", async () => {
 
   resetWorkbook({
     RAW: [
-      rawRow({ date: "05/08/2026", subcategory: "Groceries", description: "Groceries", location: "Hong Kong", amount: 50, currency: "HKD", sumHkd: 50, paymentMethod: "Octopus", syncHash: hash0 }),
+      rawRow({ date: "05/08/2026", subcategory: "Groceries", description: "Groceries", location: "Hong Kong", amount: 50, currency: "HKD", rate: 1, sumHkd: 50, paymentMethod: "Octopus", syncHash: hash0 }),
     ],
     Restaurants: [
       catRow({ date: "05/08/2026", subcategory: "Groceries", description: "Groceries", location: "Hong Kong", amount: 80 /* edited on category side */, currency: "HKD", rate: 1, sumHkd: 80, paymentMethod: "Octopus", syncHash: hash0 }),
@@ -236,6 +238,7 @@ test("catChanged: propagates to RAW, including RAW's Sum (HKD)", async () => {
   const newRaw = workbook.RAW[0];
   assert.strictEqual(newRaw[RAW_COLS.amount], 80, "RAW's amount should mirror the category row's new amount");
   assert.strictEqual(newRaw[RAW_COLS.sumHkd], 80, "RAW's Sum (HKD) should be recomputed from the category row's new amount");
+  assert.strictEqual(newRaw[RAW_COLS.rate], 1, "RAW's Exchange Rate should also be written by the catChanged propagation");
 });
 
 // ---------------------------------------------------------------------------
@@ -255,7 +258,7 @@ test("both changed differently: reported as CONFLICT, both rows left untouched",
   });
   const hash0 = computeSyncHash(inSyncFields);
 
-  const originalRaw = rawRow({ date: "01/08/2026", subcategory: "Taxi", description: "Taxi", location: "Hong Kong", amount: 45 /* RAW edited one way */, currency: "HKD", sumHkd: 40, paymentMethod: "Cash", syncHash: hash0 });
+  const originalRaw = rawRow({ date: "01/08/2026", subcategory: "Taxi", description: "Taxi", location: "Hong Kong", amount: 45 /* RAW edited one way */, currency: "HKD", rate: 1, sumHkd: 40, paymentMethod: "Cash", syncHash: hash0 });
   const originalCat = catRow({ date: "01/08/2026", subcategory: "Taxi", description: "Taxi", location: "Hong Kong", amount: 60 /* category edited a different way */, currency: "HKD", rate: 1, sumHkd: 40, paymentMethod: "Cash", syncHash: hash0 });
 
   resetWorkbook({ RAW: [originalRaw], Restaurants: [originalCat] });
@@ -290,7 +293,7 @@ test("date change on RAW: fresh historical FX lookup for the new date drives the
   const hash0 = computeSyncHash(inSyncFields);
 
   resetWorkbook({
-    RAW: [rawRow({ date: newDate /* edited */, subcategory: "Hotel", description: "Hotel", location: "Bangkok", amount: 1000, currency: "THB", sumHkd: 220, paymentMethod: "Visa BOC", syncHash: hash0 })],
+    RAW: [rawRow({ date: newDate /* edited */, subcategory: "Hotel", description: "Hotel", location: "Bangkok", amount: 1000, currency: "THB", rate: 0.22 /* stale — still the old date's rate */, sumHkd: 220, paymentMethod: "Visa BOC", syncHash: hash0 })],
     Restaurants: [catRow({ date: oldDate, subcategory: "Hotel", description: "Hotel", location: "Bangkok", amount: 1000, currency: "THB", rate: 0.22, sumHkd: 220, paymentMethod: "Visa BOC", syncHash: hash0 })],
   });
   // Different rate on the new date than the old one, to prove it's a fresh lookup, not reuse.
@@ -308,6 +311,7 @@ test("date change on RAW: fresh historical FX lookup for the new date drives the
   assert.strictEqual(newCat[STANDARD_CAT_COLS.rate], 0.225, "category row's rate should reflect the new date's historical rate");
   assert.strictEqual(newCat[STANDARD_CAT_COLS.sumHkd], 225, "category row's Sum (HKD) = 1000 * 0.225");
   assert.strictEqual(newRaw[RAW_COLS.sumHkd], 225, "RAW's own Sum (HKD) should match too (the fix under test)");
+  assert.strictEqual(newRaw[RAW_COLS.rate], 0.225, "RAW's own Exchange Rate should also be refreshed to the new date's historical rate, not left at the stale 0.22");
 });
 
 // ---------------------------------------------------------------------------
@@ -447,7 +451,7 @@ test("changeLines: rawChanged amendment names the exact columns that changed on 
 
   resetWorkbook({
     RAW: [
-      rawRow({ date: "10/08/2026", subcategory: "Dinner", description: "Dinner", location: "Hong Kong", amount: 200, currency: "USD", sumHkd: 780, syncHash: hash0 }),
+      rawRow({ date: "10/08/2026", subcategory: "Dinner", description: "Dinner", location: "Hong Kong", amount: 200, currency: "USD", rate: 7.8, sumHkd: 780, syncHash: hash0 }),
     ],
     Restaurants: [
       catRow({ date: "10/08/2026", subcategory: "Dinner", description: "Dinner", location: "Hong Kong", amount: 100, currency: "USD", rate: 7.8, sumHkd: 780, syncHash: hash0 }),
@@ -484,7 +488,7 @@ test("changeLines: catChanged amendment names RAW's changed columns", async () =
 
   resetWorkbook({
     RAW: [
-      rawRow({ date: "05/08/2026", subcategory: "Groceries", description: "Groceries", location: "Hong Kong", amount: 50, currency: "HKD", sumHkd: 50, paymentMethod: "Octopus", syncHash: hash0 }),
+      rawRow({ date: "05/08/2026", subcategory: "Groceries", description: "Groceries", location: "Hong Kong", amount: 50, currency: "HKD", rate: 1, sumHkd: 50, paymentMethod: "Octopus", syncHash: hash0 }),
     ],
     Restaurants: [
       catRow({ date: "05/08/2026", subcategory: "Groceries", description: "Groceries", location: "Hong Kong", amount: 80, currency: "HKD", rate: 1, sumHkd: 80, paymentMethod: "Octopus", syncHash: hash0 }),

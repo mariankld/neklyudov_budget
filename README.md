@@ -82,9 +82,11 @@ Send a photo instead of text (with or without a caption) and the bot reads it th
 
 ## Row shape appended by the app
 
-**`RAW` table (12 columns, always written):** Date (dd/mm/yyyy), Type (Income/Expense), Category, Subcategory, Description, Location, Amount, Currency, Sum (HKD) (blank — Excel formula), Notes, Sender, Payment Method.
+**`RAW` table (13 columns, always written):** Date (dd/mm/yyyy), Type (Income/Expense), Category, Subcategory, Description, Location, Amount, Currency, Exchange Rate, Sum (HKD), Notes, Sender, Payment Method.
 
-**Category table (17 columns, expenses only):** Дата, Категория, Описание, Локация, Сумма, Валюта, Курс (blank — Excel formula, exchange-rate lookup), Сумма (HKD) (blank — Excel formula), Примечание, Метод оплаты, Получатель/Сотрудник, Страховка (blank, not tracked by the bot), Статус выплаты (blank), Пользователь, Страховая компания (blank), Период покрытия (blank), Карта (blank).
+**Category table (17 columns, expenses only):** Дата, Категория, Описание, Локация, Сумма, Валюта, Курс, Сумма (HKD), Примечание, Метод оплаты, Получатель/Сотрудник, Страховка (blank, not tracked by the bot), Статус выплаты (blank), Пользователь, Страховая компания (blank), Период покрытия (blank), Карта (blank).
+
+**Exchange Rate / Курс and Sum (HKD):** both are bot-computed static numbers, not Excel formulas — frozen to the transaction's own date via `fxRates.getRateToHkd(currency, date)` (historical rate, not "today's" rate) at write time, so they never silently change if a later day's rate updates. `RAW`'s Exchange Rate column sits immediately after Currency; `syncJob.js`'s bidirectional sync keeps it in step with the category table's Курс whenever either side is edited.
 
 > This 17-column shape is now the exception, not the rule — see `src/syncJob.js`'s `STANDARD_CAT_COLS` / `INSURANCE_CAT_COLS` / `CREDITCARDS_CAT_COLS` for each table's actual current layout: most tables are the standard 12 columns (+ RowID/SyncHash), Health/MedInsurance kept all 5 insurance columns (19 total), and CreditCards keeps only Карта (15 total).
 

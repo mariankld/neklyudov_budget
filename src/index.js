@@ -968,7 +968,7 @@ function formatDraftPreview(draft, categorySheetName) {
   ].join("\n");
 }
 
-function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
+function buildRawRowValues(draft, categorySheetName, rate, sumHkd, rowId, syncHash) {
   const notesCell = draft.notes && draft.notes.length ? draft.notes : "";
   /**
    * Credit Cards rows never get a user-confirmed Payment Method (the forced Карта picker replaces
@@ -988,6 +988,7 @@ function buildRawRowValues(draft, categorySheetName, sumHkd, rowId, syncHash) {
     draft.location,
     draft.amount,
     draft.currency,
+    rate, // Exchange Rate — frozen to this transaction's own date, bot-computed (see fxRates.js)
     sumHkd,
     notesCell,
     draft.sender || "Unknown",
@@ -1192,7 +1193,7 @@ async function appendTransactionToExcel(draft) {
     subcategory: draft.subcategory,
   });
 
-  const rawRow = buildRawRowValues(draft, draft.category, fx.sumHkd, rowId, syncHash);
+  const rawRow = buildRawRowValues(draft, draft.category, fx.rate, fx.sumHkd, rowId, syncHash);
 
   await appendTableRow(driveId, itemId, RAW_SHEET, rawRow);
 
