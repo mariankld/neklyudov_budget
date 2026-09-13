@@ -139,6 +139,35 @@ async function getTableRows(driveId, itemId, tableName) {
   }
 }
 
+/**
+ * Reads a table's data-body range address (e.g. "Staff Spending!A3:N93") — used to translate
+ * between "the row I see on screen in Excel" (an absolute worksheet row number) and "the
+ * zero-based data-row index" every other helper here uses (getTableRows/updateTableRowByIndex/
+ * deleteTableRowByIndex). Needed because a table's data doesn't necessarily start at worksheet
+ * row 2 — there can be title rows, frozen panes, etc. above it.
+ */
+async function getTableDataBodyRangeAddress(driveId, itemId, tableName) {
+  const token = await getAccessToken();
+  try {
+    const { data } = await axios.get(
+      `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
+        tableName
+      )}')/dataBodyRange?$select=address`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    return data.address;
+  } catch (err) {
+    if (err.response && err.response.data) {
+      const graphError = err.response.data.error || err.response.data;
+      err.graphDetail = `[${tableName} dataBodyRange] ${graphError.code || ''} ${
+        graphError.message || JSON.stringify(graphError)
+      }`.trim();
+      err.message = err.graphDetail;
+    }
+    throw err;
+  }
+}
+
 /** Reads a table's header row (column names in order) — used to locate columns by name instead of a hardcoded index. */
 async function getTableHeaders(driveId, itemId, tableName) {
   const token = await getAccessToken();
@@ -240,6 +269,103 @@ async function addTableColumn(driveId, itemId, tableName, columnName) {
   }
 }
 
+/**
+ * Reads a table's full range address (header row + data rows together), e.g.
+ * "Personal Spending!A4:L25" — used before deleting a table so the leftover cells it occupied
+ * can be cleared afterward (deleting an Excel Table via Graph un-tableifies the range but leaves
+ * the cell values sitting there as plain cells).
+ */
+async function getTableRangeAddress(driveId, itemId, tableName) {
+  const token = await getAccessToken();
+  const { data } = await axios.get(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
+      tableName
+    )}')/range?$select=address`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return data.address;
+}
+
+/** Deletes an Excel Table object (un-tableifies its range; does NOT clear the underlying cell values — call clearRange for that). */
+async function deleteTable(driveId, itemId, tableName) {
+  const token = await getAccessToken();
+  await axios.delete(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/tables('${encodeURIComponent(
+      tableName
+    )}')`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+}
+
+/** Clears the contents (not formatting) of an explicit worksheet range — used to wipe leftover cell values after a table has been moved elsewhere and deleted. */
+async function clearRangeContents(driveId, itemId, worksheetName, address) {
+  const token = await getAccessToken();
+  await axios.post(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets('${encodeURIComponent(
+      worksheetName
+    )}')/range(address='${address}')/clear`,
+    { applyTo: 'Contents' },
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+  );
+}
+
+/** Lists every worksheet/tab name in the workbook — used to check whether one already exists before creating it (idempotency after a partial/failed run). */
+async function listWorksheets(driveId, itemId) {
+  const token = await getAccessToken();
+  const { data } = await axios.get(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets?$select=name`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return data.value.map((w) => w.name);
+}
+
+/** Lists every worksheet/tab with its current left-to-right tab position (0-based) — used to reorder tabs. */
+async function listWorksheetsWithPosition(driveId, itemId) {
+  const token = await getAccessToken();
+  const { data } = await axios.get(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets?$select=name,position`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return data.value.map((w) => ({ name: w.name, position: w.position })).sort((a, b) => a.position - b.position);
+}
+
+/** Moves a worksheet/tab to a specific 0-based position, reordering the tab strip (other tabs shift to make room). */
+async function setWorksheetPosition(driveId, itemId, worksheetName, position) {
+  const token = await getAccessToken();
+  const { data } = await axios.patch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets('${encodeURIComponent(
+      worksheetName
+    )}')`,
+    { position },
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+  );
+  return data;
+}
+
+/** Adds a brand-new worksheet/tab to the workbook (e.g. for splitting a combined tab into two). */
+async function addWorksheet(driveId, itemId, name) {
+  const token = await getAccessToken();
+  const { data } = await axios.post(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets/add`,
+    { name },
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+  );
+  return data;
+}
+
+/** Renames a worksheet/tab (distinct from renameTable, which renames the Excel Table object, not the tab itself). */
+async function renameWorksheet(driveId, itemId, currentName, newName) {
+  const token = await getAccessToken();
+  const { data } = await axios.patch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets('${encodeURIComponent(
+      currentName
+    )}')`,
+    { name: newName },
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+  );
+  return data;
+}
+
 /** Creates a brand-new Excel Table on an existing worksheet from a starting range (e.g. "A1:E1" with headers already in row 1). */
 async function createTable(driveId, itemId, worksheetName, address, hasHeaders = true) {
   const token = await getAccessToken();
@@ -247,7 +373,11 @@ async function createTable(driveId, itemId, worksheetName, address, hasHeaders =
     `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets('${encodeURIComponent(
       worksheetName
     )}')/tables/add`,
-    { address: `${worksheetName}!${address}`, hasHeaders },
+    // Relative address only ("A1:L1") — the endpoint is already scoped to worksheetName via the
+    // URL path above. Prefixing it here too (e.g. "Staff Advances!A1:L1") broke for any sheet
+    // name containing a space (Graph 400 InvalidArgument, reproduced 2026-09-13 on "Staff
+    // Advances").
+    { address, hasHeaders },
     { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
   );
   return data;
@@ -304,6 +434,31 @@ async function setRangeFormulas(driveId, itemId, worksheetName, address, formula
   return data;
 }
 
+/** Reads a worksheet range's numberFormat (2D array) — used to diagnose date/currency display bugs. */
+async function getRangeNumberFormat(driveId, itemId, worksheetName, address) {
+  const token = await getAccessToken();
+  const { data } = await axios.get(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets('${encodeURIComponent(
+      worksheetName
+    )}')/range(address='${address}')?$select=numberFormat,values,address`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return data;
+}
+
+/** Writes a numberFormat (2D array, e.g. [["dd/mm/yyyy"]]) onto an explicit range — cell values are untouched. */
+async function setRangeNumberFormat(driveId, itemId, worksheetName, address, numberFormat) {
+  const token = await getAccessToken();
+  const { data } = await axios.patch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/workbook/worksheets('${encodeURIComponent(
+      worksheetName
+    )}')/range(address='${address}')`,
+    { numberFormat },
+    { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } }
+  );
+  return data;
+}
+
 /** Gets a worksheet's used range (values + formulas + address) — the entry point for the Summary formula audit. */
 async function getUsedRange(driveId, itemId, worksheetName) {
   const token = await getAccessToken();
@@ -322,14 +477,25 @@ module.exports = {
   listWorkbookTables,
   appendTableRow,
   getTableRows,
+  getTableDataBodyRangeAddress,
   getTableHeaders,
   updateTableRowByIndex,
   deleteTableRowByIndex,
   addTableColumn,
+  getTableRangeAddress,
+  deleteTable,
+  clearRangeContents,
+  listWorksheets,
+  listWorksheetsWithPosition,
+  setWorksheetPosition,
+  addWorksheet,
+  renameWorksheet,
   createTable,
   renameTable,
   setRangeValues,
   getRangeFormulas,
   setRangeFormulas,
+  getRangeNumberFormat,
+  setRangeNumberFormat,
   getUsedRange,
 };

@@ -14,7 +14,9 @@
     "audit-summary": "node scripts/audit-summary-formulas.js",
     "fix-summary": "node scripts/fix-summary-formulas.js",
     "fix-h20-credit-card": "node scripts/fix-h20-credit-card-total.js",
-    "migrate-workbook": "node scripts/migrate-workbook.js"
+    "migrate-workbook": "node scripts/migrate-workbook.js",
+    "split-staff-advances": "node scripts/split-staff-advances.js",
+    "fix-staff-advances-dates": "node scripts/fix-staff-advances-dates.js"
   },
   "keywords": [],
   "author": "",

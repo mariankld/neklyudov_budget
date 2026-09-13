@@ -20,7 +20,8 @@ const CATEGORY_TABLE_MAP = require("./lib/categoryTableMap");
 //     pre-migration width is 17, not 12 — RowID/SyncHash get appended on top, landing at
 //     19 columns total. Matches src/syncJob.js's INSURANCE_CAT_COLS and
 //     src/index.js's INSURANCE_CATEGORY_TABLES branch in buildCategoryRowValues.
-//   - Every other category table (including Personal Spending / StaffExpenses) is expected at
+//   - Every other category table (including Staff Spending / StaffExpenses, and the newer
+//     Staff Advances / StaffAdvances split out of it on 2026-09-13) is expected at
 //     the standard pre-migration width of 12 (5 insurance columns already removed, Пользователь
 //     moved to the end — the cleanup Mariya did by hand to 12 tables on 2026-08-19). If
 //     StaffExpenses still shows up at 17 columns, it hasn't had that cleanup done yet — this

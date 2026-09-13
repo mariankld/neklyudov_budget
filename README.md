@@ -122,7 +122,8 @@ Defined in `CATEGORY_TABLE_MAP` in `src/index.js`:
 | Entertainment | Entertainment |
 | Restaurants | Restaurants |
 | Family and Staff | FamilyStaff |
-| Personal Spending | StaffExpenses |
+| Staff Spending | StaffExpenses |
+| Staff Advances | StaffAdvances |
 | Other | Other |
 | Subscriptions | TelecomSubscriptions |
 | Travel | Travel |
