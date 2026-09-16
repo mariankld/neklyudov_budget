@@ -16,7 +16,8 @@
     "fix-h20-credit-card": "node scripts/fix-h20-credit-card-total.js",
     "migrate-workbook": "node scripts/migrate-workbook.js",
     "split-staff-advances": "node scripts/split-staff-advances.js",
-    "fix-staff-advances-dates": "node scripts/fix-staff-advances-dates.js"
+    "fix-staff-advances-dates": "node scripts/fix-staff-advances-dates.js",
+    "add-staff-balance-formulas": "node scripts/add-staff-balance-formulas.js"
   },
   "keywords": [],
   "author": "",

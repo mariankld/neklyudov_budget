@@ -134,3 +134,45 @@ Defined in `CATEGORY_TABLE_MAP` in `src/index.js`:
 | CAPEX | CAPEX |
 
 `Income` has no entry — it's RAW-only.
+
+## Commands
+
+Sent as plain Telegram messages, checked before the normal expense-parsing flow:
+
+| Command | Effect |
+| --- | --- |
+| `/cancel` | Cancels a pending edit. |
+| `/ignore <text>` | Silent no-op — lets you leave a comment in the chat without it being parsed as an expense. |
+| `/sync` | Runs the daily maintenance jobs (CurrencyRates refresh + RAW ↔ category-table sync) immediately, useful right after editing a row directly in Excel. |
+| `/staff` | Replies with each helper's (Marietta, Yaya) remaining balance, and the amount/date of their most recent advance. See below. |
+
+## Staff Advances / Staff Spending recipient
+
+Every row logged under **Staff Advances** or **Staff Spending** must have `Получатель/Сотрудник` set to exactly one of **Marietta** or **Yaya** — this is enforced in `src/index.js` (`STAFF_MEMBERS`, `findKnownStaffMember`), so the balance math below is never thrown off by a typo or a missing name.
+
+- If OpenAI can't confidently extract one of the two names from the message, the bot does **not** guess — the normal Yes/Edit confirmation is replaced with a forced 2-button picker (`buildStaffRecipientKeyboard`) and the entry can't be logged until one is tapped.
+- Recipient casing is normalized on every draft (e.g. "yaya" → "Yaya") so downstream `SUMIF`/`SUMIFS`/`MAXIFS` matching, in both the `/staff` command and the live Excel formulas below, never misses a row.
+
+## Staff balance summary (`/staff` + live Excel formulas)
+
+The remaining balance for each helper is available two ways, and both use the same logic so they always agree:
+
+1. **The `/staff` Telegram command** — computed on demand in `getStaffBalancesReport()` (`src/index.js`) from the live `StaffAdvances`/`StaffExpenses` tables.
+2. **A live formula block** in columns **Q:V** of the "Staff Advances" worksheet, one row per helper, so the numbers are visible directly in Excel without needing the bot. Set it up once with:
+
+   ```
+   npm run add-staff-balance-formulas -- --apply
+   ```
+
+   (run without `--apply` first for a dry run). This writes:
+
+   | Col | Header | Formula |
+   | --- | --- | --- |
+   | Q | Staff | `Marietta` / `Yaya` (plain values) |
+   | R | Total Advances (HKD) | `SUMIF` over `StaffAdvances` |
+   | S | Total Spent (HKD) | `SUMIF` over `StaffExpenses` |
+   | T | Remaining (HKD) | `R - S` |
+   | U | Last Advance Amount (HKD) | `SUMIFS` — every `StaffAdvances` row dated exactly the date in V |
+   | V | Last Advance Date | `MAXIFS` — the latest date among that helper's `StaffAdvances` rows |
+
+Since an advance can arrive as several receipts, **each distinct date is treated as one advance**: rows for the same helper logged on the same day are summed together (U), but different dates are separate advances — only the most recent date's total is shown as "last advance". `StaffAdvances[Дата]` stores real Excel date serials (see `scripts/fix-staff-advances-dates.js`), so `MAXIFS` works on it directly; the script also copies the worksheet's existing date `numberFormat` onto V2:V3 so it displays as a date rather than a raw serial number.

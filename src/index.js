@@ -5,9 +5,9 @@ const path = require("path");
 const express = require("express");
 const axios = require("axios");
 const OpenAI = require("openai");
-const { listWorkbookTables, appendTableRow } = require("./graphExcel");
+const { listWorkbookTables, appendTableRow, getTableRows } = require("./graphExcel");
 const fxRates = require("./fxRates");
-const { computeSyncHash, runSync, formatSyncReport } = require("./syncJob");
+const { computeSyncHash, runSync, formatSyncReport, STANDARD_CAT_COLS } = require("./syncJob");
 const { refreshCurrencyRatesTable, formatDailyJobsReport } = require("./dailyJobs");
 
 const app = express();
@@ -70,6 +70,26 @@ const DEFAULT_SUBCATEGORY_BY_CATEGORY = {
  * buildCategoryRowValues, where the pick lands in the Карта column and Метод оплаты is left blank.
  */
 const CREDIT_CARDS_CATEGORY = "Credit Cards";
+
+/**
+ * The only two valid values for Получатель/Сотрудник (recipient) on Staff Advances and Staff
+ * Spending — every advance/expense logged under these two categories must be attributed to
+ * exactly one of these two people so remaining-balance math (getStaffBalancesReport / the /staff
+ * command, and the live Q:V formula block on the "Staff Advances" tab — see
+ * scripts/add-staff-balance-formulas.js) is always correct. If OpenAI can't tell who it was from
+ * the message, the Telegram confirmation is gated behind a 2-button picker instead of guessing —
+ * see keyboardForDraft/buildStaffRecipientKeyboard below. Mariya, 2026-09-15. Free-text recipients
+ * on every other category are unaffected.
+ */
+const STAFF_MEMBERS = ["Marietta", "Yaya"];
+const STAFF_RECIPIENT_CATEGORIES = ["Staff Advances", "Staff Spending"];
+
+/** Case-insensitive exact match against STAFF_MEMBERS; returns the canonical stored casing, or null. */
+function findKnownStaffMember(raw) {
+  const needle = String(raw || "").trim().toLowerCase();
+  if (!needle) return null;
+  return STAFF_MEMBERS.find((m) => m.toLowerCase() === needle) || null;
+}
 
 /**
  * Categories the bot must never log to itself. Credit Cards was removed 2026-08-20: a live
@@ -443,9 +463,26 @@ function buildCardKeyboard(token) {
 }
 
 /**
+ * Forced picker for Staff Advances / Staff Spending (Mariya, 2026-09-15): exactly the 2 fixed
+ * STAFF_MEMBERS buttons, no "Other" — unlike the card/payment-method pickers, there is no third
+ * option here, since a recipient outside {Marietta, Yaya} on these categories is never valid.
+ * Mirrors buildPaymentMethodKeyboard's index-based callback_data pattern
+ * (staffrecip:<token>:<index into STAFF_MEMBERS>).
+ */
+function buildStaffRecipientKeyboard(token) {
+  const row = STAFF_MEMBERS.map((name, idx) => {
+    const data = `staffrecip:${token}:${idx}`;
+    assertCallbackDataLength(data);
+    return { text: name, callback_data: data };
+  });
+  return { inline_keyboard: [row] };
+}
+
+/**
  * Gates the normal Yes/Edit keyboard behind a resolved payment method (or, for Credit Cards, a
- * resolved card). Credit Cards is checked first and short-circuits everything else — paymentMethod
- * is ignored entirely for this category, per Mariya (2026-08-21). Otherwise, three states:
+ * resolved card; or, for Staff Advances/Staff Spending, a resolved Marietta/Yaya recipient).
+ * Credit Cards and the staff categories are checked first and short-circuit everything else, per
+ * Mariya (2026-08-21 / 2026-09-15). For everything else, three payment-method states:
  *   1. paymentMethod already resolved -> buildConfirmKeyboard.
  *   2. paymentMethod unclear but paymentMethodRaw names something genuinely new (not a known
  *      method under any casing) -> buildNewPaymentMethodKeyboard, offering to learn it.
@@ -455,6 +492,9 @@ function buildCardKeyboard(token) {
 function keyboardForDraft(token, draft) {
   if (draft.category === CREDIT_CARDS_CATEGORY) {
     return draft.card ? buildConfirmKeyboard(token) : buildCardKeyboard(token);
+  }
+  if (STAFF_RECIPIENT_CATEGORIES.includes(draft.category) && !findKnownStaffMember(draft.recipient)) {
+    return buildStaffRecipientKeyboard(token);
   }
   if (draft.paymentMethod !== PAYMENT_METHOD_UNCLEAR) {
     return buildConfirmKeyboard(token);
@@ -517,6 +557,41 @@ function formatDateDdMmYyyy(date) {
   const m = (date.getMonth() + 1).toString().padStart(2, "0");
   const y = date.getFullYear();
   return `${d}/${m}/${y}`;
+}
+
+/**
+ * getTableRows() returns raw Graph cell values, not display text. The Dата column on
+ * StaffAdvances/StaffExpenses can come back either as the "dd/mm/yyyy" string the bot wrote
+ * originally, or as a bare Excel date serial number (days since 1899-12-30) if the cell got
+ * re-typed as a real Excel date along the way — see scripts/fix-staff-advances-dates.js and
+ * scripts/backfill-raw-exchange-rate.js's normalizeDate, which hit the exact same ambiguity.
+ * Used by getStaffBalancesReport() (Mariya, 2026-09-15) to find each recipient's most recent
+ * advance date regardless of which representation a given row happens to have. Returns a UTC
+ * midnight Date, or null if the cell is empty/unparseable.
+ */
+function parseCellDate(rawDate) {
+  const asString = String(rawDate == null ? "" : rawDate).trim();
+  if (!asString) return null;
+
+  const ddmmyyyy = asString.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (ddmmyyyy) {
+    const [, dd, mm, yyyy] = ddmmyyyy;
+    return new Date(Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd)));
+  }
+
+  const serial = Number(asString);
+  if (Number.isFinite(serial) && serial > 0) {
+    return new Date(Date.UTC(1899, 11, 30) + serial * 86400000);
+  }
+  return null;
+}
+
+/** Formats a UTC-midnight Date (as produced by parseCellDate) back to dd/mm/yyyy for Telegram replies. */
+function formatCellDateDdMmYyyy(date) {
+  const dd = String(date.getUTCDate()).padStart(2, "0");
+  const mm = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const yyyy = date.getUTCFullYear();
+  return `${dd}/${mm}/${yyyy}`;
 }
 
 /**
@@ -904,6 +979,22 @@ function normalizeDraft(result, messageDate) {
     normalized.subcategory = DEFAULT_SUBCATEGORY_BY_CATEGORY[normalized.category];
   }
 
+  /**
+   * Canonicalize recipient casing for Staff Advances/Staff Spending (Mariya, 2026-09-15): if
+   * OpenAI (or an edit) extracted something that case-insensitively matches Marietta or Yaya —
+   * "yaya", "MARIETTA ", etc. — normalize it to the canonical stored spelling so downstream
+   * SUMIF/SUMIFS (both getStaffBalancesReport and the live Excel formula block) never miss a row
+   * over a casing mismatch. Anything that doesn't match either name (including empty string) is
+   * left as-is so keyboardForDraft's staff-recipient gate correctly treats it as unresolved and
+   * asks via buildStaffRecipientKeyboard.
+   */
+  if (STAFF_RECIPIENT_CATEGORIES.includes(normalized.category)) {
+    const known = findKnownStaffMember(normalized.recipient);
+    if (known) {
+      normalized.recipient = known;
+    }
+  }
+
   return normalized;
 }
 
@@ -948,6 +1039,16 @@ function formatDraftPreview(draft, categorySheetName) {
             : draft.paymentMethod
         }`;
 
+  /**
+   * Staff Advances / Staff Spending must always end up with recipient = Marietta or Yaya — mirrors
+   * the "not yet chosen" wording used for card/payment method above (Mariya, 2026-09-15). See
+   * keyboardForDraft/buildStaffRecipientKeyboard, which forces the picker whenever this is true.
+   */
+  const recipientLine =
+    STAFF_RECIPIENT_CATEGORIES.includes(categorySheetName) && !findKnownStaffMember(draft.recipient)
+      ? "Recipient: ⚠️ Not yet chosen — please pick below"
+      : `Recipient: ${draft.recipient && draft.recipient.length ? draft.recipient : "—"}`;
+
   return [
     "I will log this as:",
     "",
@@ -961,7 +1062,7 @@ function formatDraftPreview(draft, categorySheetName) {
     `Currency: ${draft.currency}`,
     "Sum (HKD): (calculated automatically from that day's exchange rate)",
     paymentOrCardLine,
-    `Recipient: ${draft.recipient && draft.recipient.length ? draft.recipient : "—"}`,
+    recipientLine,
     `Logged by: ${draft.sender || "Unknown"}`,
     notesLine,
     "",
@@ -1222,6 +1323,88 @@ async function appendTransactionToExcel(draft) {
   return fx;
 }
 
+/**
+ * Powers the /staff command (Mariya, 2026-09-15). Reads StaffAdvances and StaffExpenses in full
+ * and, for each of STAFF_MEMBERS, computes: total advances (HKD), total spent (HKD), remaining
+ * balance, and the most recent advance's amount + date.
+ *
+ * "Most recent advance" per Mariya's explicit instruction ("treat each dated entry as its own
+ * advance"): every distinct date on which that person has StaffAdvances rows is one advance
+ * event; if a single advance was paid out via several receipts on the same day, those rows are
+ * summed together as one event. The event with the latest date is "the most recent advance", and
+ * its amount is the sum of every StaffAdvances row for that person dated exactly that day — this
+ * mirrors the U2/V2 formulas written to the "Staff Advances" worksheet by
+ * scripts/add-staff-balance-formulas.js, so the bot and the live spreadsheet always agree.
+ */
+async function getStaffBalancesReport() {
+  const driveId = getExcelDriveIdFromEnv();
+  const itemId = getExcelItemIdFromEnv();
+
+  const [advanceRows, spendingRows] = await Promise.all([
+    getTableRows(driveId, itemId, CATEGORY_TABLE_MAP["Staff Advances"]),
+    getTableRows(driveId, itemId, CATEGORY_TABLE_MAP["Staff Spending"]),
+  ]);
+
+  return STAFF_MEMBERS.map((name) => {
+    let totalAdvances = 0;
+    let totalSpent = 0;
+    // dateKey (ms since epoch) -> summed HKD amount for that day's advance(s)
+    const advancesByDay = new Map();
+
+    for (const row of advanceRows) {
+      if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
+      const amount = Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
+      totalAdvances += amount;
+
+      const date = parseCellDate(row[STANDARD_CAT_COLS.date]);
+      if (!date) continue;
+      const dateKey = date.getTime();
+      advancesByDay.set(dateKey, {
+        date,
+        amount: (advancesByDay.get(dateKey)?.amount || 0) + amount,
+      });
+    }
+
+    for (const row of spendingRows) {
+      if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
+      totalSpent += Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
+    }
+
+    let lastAdvance = null;
+    for (const entry of advancesByDay.values()) {
+      if (!lastAdvance || entry.date.getTime() > lastAdvance.date.getTime()) {
+        lastAdvance = entry;
+      }
+    }
+
+    return {
+      name,
+      totalAdvances: roundMoney(totalAdvances),
+      totalSpent: roundMoney(totalSpent),
+      remaining: roundMoney(totalAdvances - totalSpent),
+      lastAdvanceAmount: lastAdvance ? roundMoney(lastAdvance.amount) : null,
+      lastAdvanceDateLabel: lastAdvance ? formatCellDateDdMmYyyy(lastAdvance.date) : null,
+    };
+  });
+}
+
+function formatMoneyHkd(n) {
+  return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/** Formats getStaffBalancesReport()'s output into the /staff Telegram reply. */
+function formatStaffBalancesMessage(report) {
+  const lines = ["💰 Staff Balances", ""];
+  for (const r of report) {
+    const lastAdvanceLine =
+      r.lastAdvanceAmount != null
+        ? `Last advance: HKD ${formatMoneyHkd(r.lastAdvanceAmount)} on ${r.lastAdvanceDateLabel}`
+        : "Last advance: —";
+    lines.push(`${r.name}:`, `  Remaining: HKD ${formatMoneyHkd(r.remaining)}`, `  ${lastAdvanceLine}`, "");
+  }
+  return lines.join("\n").trim();
+}
+
 function isStartCommand(text) {
   if (!text || typeof text !== "string") return false;
   const t = text.trim();
@@ -1244,6 +1427,7 @@ function getWelcomeMessage() {
     "• If you're editing and change your mind, send /cancel.",
     "• To leave a comment or send a message without triggering the bot, start your message with /ignore, e.g. \"/ignore I already logged this expense\".",
     "• To prevent inconsistencies, RAW and the category tabs sync automatically every day. If you edited a row directly in Excel and want it reflected right away, send /sync.",
+    "• To see each helper's remaining balance and most recent advance, send /staff.",
   ].join("\n");
 }
 
@@ -1393,6 +1577,11 @@ function isIgnoreCommand(text) {
 function isSyncCommand(text) {
   const t = (text || "").trim();
   return t === "/sync" || t.startsWith("/sync ");
+}
+
+function isStaffCommand(text) {
+  const t = (text || "").trim();
+  return t === "/staff" || t.startsWith("/staff ");
 }
 
 /**
@@ -1960,6 +2149,50 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  const staffRecipPrefix = "staffrecip:";
+  if (data.startsWith(staffRecipPrefix)) {
+    const rest = data.slice(staffRecipPrefix.length);
+    const sepIdx = rest.lastIndexOf(":");
+    const token = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const idx = sepIdx === -1 ? NaN : Number(rest.slice(sepIdx + 1));
+
+    prunePending();
+    const entry = pendingByToken.get(token);
+    if (!entry) {
+      await tell(
+        "⚠️ This confirmation is not on this server anymore. Send the expense again. With multiple replicas, use only one instance."
+      );
+      return;
+    }
+    if (entry.chatId !== chatId) {
+      await tell("Not allowed.");
+      return;
+    }
+    if (!Number.isInteger(idx) || idx < 0 || idx >= STAFF_MEMBERS.length) {
+      await tell("⚠️ Unrecognized staff option — send the expense again.");
+      return;
+    }
+
+    entry.draft.recipient = STAFF_MEMBERS[idx];
+
+    const staffThreadExtras =
+      entry.messageThreadId != null
+        ? { message_thread_id: entry.messageThreadId }
+        : callbackExtras;
+    // Not buildConfirmKeyboard directly: payment method may still be unresolved for this draft,
+    // so re-run the full gate (mirrors the newpm: handler above).
+    const preview = formatDraftPreview(entry.draft, entry.draft.category);
+    const keyboard = keyboardForDraft(token, entry.draft);
+
+    try {
+      await editTelegramMessage(chatId, messageId, preview, keyboard, staffThreadExtras);
+    } catch (e) {
+      console.error("editTelegramMessage (staff recipient select):", e.message);
+      await sendTelegramMessage(chatId, preview, entry.sourceMessageId, keyboard, staffThreadExtras);
+    }
+    return;
+  }
+
   await tell("Unknown button.");
 }
 
@@ -2116,6 +2349,24 @@ app.post("/webhook/telegram", async (req, res) => {
             await sendTelegramMessage(chatId, `❌ Sync failed: ${err.message}`, messageId, undefined, threadExtras);
           } catch (notifyErr) {
             console.error("Failed to send /sync failure message:", notifyErr.message);
+          }
+        }
+      })();
+      return;
+    }
+
+    if (isStaffCommand(originalMessage)) {
+      res.status(200).json({ ok: true });
+      (async () => {
+        try {
+          const report = await getStaffBalancesReport();
+          await sendTelegramMessage(chatId, formatStaffBalancesMessage(report), messageId, undefined, threadExtras);
+        } catch (err) {
+          console.error("/staff failed:", err.stack || err.message);
+          try {
+            await sendTelegramMessage(chatId, `❌ Could not load staff balances: ${err.message}`, messageId, undefined, threadExtras);
+          } catch (notifyErr) {
+            console.error("Failed to send /staff failure message:", notifyErr.message);
           }
         }
       })();
