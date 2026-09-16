@@ -1335,6 +1335,10 @@ async function appendTransactionToExcel(draft) {
  * its amount is the sum of every StaffAdvances row for that person dated exactly that day — this
  * mirrors the U2/V2 formulas written to the "Staff Advances" worksheet by
  * scripts/add-staff-balance-formulas.js, so the bot and the live spreadsheet always agree.
+ *
+ * Yaya's numbers are converted to THB (today's rate) for display in the /staff reply only — see
+ * the comment above the STAFF_MEMBERS.map() loop below. The Excel Q:V formula block is untouched
+ * and still reports everyone in HKD.
  */
 async function getStaffBalancesReport() {
   const driveId = getExcelDriveIdFromEnv();
@@ -1345,50 +1349,75 @@ async function getStaffBalancesReport() {
     getTableRows(driveId, itemId, CATEGORY_TABLE_MAP["Staff Spending"]),
   ]);
 
-  return STAFF_MEMBERS.map((name) => {
-    let totalAdvances = 0;
-    let totalSpent = 0;
-    // dateKey (ms since epoch) -> summed HKD amount for that day's advance(s)
-    const advancesByDay = new Map();
+  // /staff shows Yaya's numbers in THB (today's rate) since baht is what actually gets handed to
+  // her and what she spends — easier for Mariya to sanity-check at a glance. This is display-only:
+  // the underlying ledger (StaffAdvances/StaffExpenses, Сумма (HKD), and the Q:V Excel formulas)
+  // stays in HKD for everyone exactly as before; only this Telegram message's numbers for Yaya get
+  // converted. Marietta is unaffected. Mariya, 2026-09-16.
+  const todayDdMmYyyy = formatDateDdMmYyyy(new Date());
 
-    for (const row of advanceRows) {
-      if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
-      const amount = Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
-      totalAdvances += amount;
+  return Promise.all(
+    STAFF_MEMBERS.map(async (name) => {
+      let totalAdvances = 0;
+      let totalSpent = 0;
+      // dateKey (ms since epoch) -> summed HKD amount for that day's advance(s)
+      const advancesByDay = new Map();
 
-      const date = parseCellDate(row[STANDARD_CAT_COLS.date]);
-      if (!date) continue;
-      const dateKey = date.getTime();
-      advancesByDay.set(dateKey, {
-        date,
-        amount: (advancesByDay.get(dateKey)?.amount || 0) + amount,
-      });
-    }
+      for (const row of advanceRows) {
+        if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
+        const amount = Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
+        totalAdvances += amount;
 
-    for (const row of spendingRows) {
-      if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
-      totalSpent += Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
-    }
-
-    let lastAdvance = null;
-    for (const entry of advancesByDay.values()) {
-      if (!lastAdvance || entry.date.getTime() > lastAdvance.date.getTime()) {
-        lastAdvance = entry;
+        const date = parseCellDate(row[STANDARD_CAT_COLS.date]);
+        if (!date) continue;
+        const dateKey = date.getTime();
+        advancesByDay.set(dateKey, {
+          date,
+          amount: (advancesByDay.get(dateKey)?.amount || 0) + amount,
+        });
       }
-    }
 
-    return {
-      name,
-      totalAdvances: roundMoney(totalAdvances),
-      totalSpent: roundMoney(totalSpent),
-      remaining: roundMoney(totalAdvances - totalSpent),
-      lastAdvanceAmount: lastAdvance ? roundMoney(lastAdvance.amount) : null,
-      lastAdvanceDateLabel: lastAdvance ? formatCellDateDdMmYyyy(lastAdvance.date) : null,
-    };
-  });
+      for (const row of spendingRows) {
+        if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
+        totalSpent += Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
+      }
+
+      let lastAdvance = null;
+      for (const entry of advancesByDay.values()) {
+        if (!lastAdvance || entry.date.getTime() > lastAdvance.date.getTime()) {
+          lastAdvance = entry;
+        }
+      }
+
+      // Convert this person's totals from HKD into their /staff display currency. Only Yaya
+      // converts (to THB, using today's rate); everyone else displays in HKD unchanged. A failed
+      // rate lookup falls back to HKD rather than blocking the whole /staff reply.
+      let displayCurrency = "HKD";
+      let toDisplay = (n) => n;
+      if (name === "Yaya") {
+        try {
+          const hkdPerThb = await fxRates.getRateToHkd("THB", todayDdMmYyyy);
+          displayCurrency = "THB";
+          toDisplay = (n) => n / hkdPerThb;
+        } catch (err) {
+          console.error("getStaffBalancesReport: THB rate lookup failed, showing Yaya in HKD instead:", err.message);
+        }
+      }
+
+      return {
+        name,
+        currency: displayCurrency,
+        totalAdvances: roundMoney(toDisplay(totalAdvances)),
+        totalSpent: roundMoney(toDisplay(totalSpent)),
+        remaining: roundMoney(toDisplay(totalAdvances - totalSpent)),
+        lastAdvanceAmount: lastAdvance ? roundMoney(toDisplay(lastAdvance.amount)) : null,
+        lastAdvanceDateLabel: lastAdvance ? formatCellDateDdMmYyyy(lastAdvance.date) : null,
+      };
+    })
+  );
 }
 
-function formatMoneyHkd(n) {
+function formatStaffMoney(n) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
@@ -1398,9 +1427,9 @@ function formatStaffBalancesMessage(report) {
   for (const r of report) {
     const lastAdvanceLine =
       r.lastAdvanceAmount != null
-        ? `Last advance: HKD ${formatMoneyHkd(r.lastAdvanceAmount)} on ${r.lastAdvanceDateLabel}`
+        ? `Last advance: ${r.currency} ${formatStaffMoney(r.lastAdvanceAmount)} on ${r.lastAdvanceDateLabel}`
         : "Last advance: —";
-    lines.push(`${r.name}:`, `  Remaining: HKD ${formatMoneyHkd(r.remaining)}`, `  ${lastAdvanceLine}`, "");
+    lines.push(`${r.name}:`, `  Remaining: ${r.currency} ${formatStaffMoney(r.remaining)}`, `  ${lastAdvanceLine}`, "");
   }
   return lines.join("\n").trim();
 }
