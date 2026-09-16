@@ -166,12 +166,28 @@ function staffRowFormulas(staffCell, currency) {
   await setRangeValues(EXCEL_DRIVE_ID, EXCEL_ITEM_ID, WORKSHEET, "Q2:R3", staffValues);
   await setRangeFormulas(EXCEL_DRIVE_ID, EXCEL_ITEM_ID, WORKSHEET, "S2:Y2", [rowFormulas[0]]);
   await setRangeFormulas(EXCEL_DRIVE_ID, EXCEL_ITEM_ID, WORKSHEET, "S3:Y3", [rowFormulas[1]]);
+
+  // V (Last Advance Amount) sits where the OLD Q:V layout used to have "Last Advance Date" — those
+  // cells still carry that old date numberFormat, which silently turns a real amount like 4055 into
+  // "13/12/1910" (Excel just renders the number as a date serial). Explicitly reset V, and every
+  // other plain-number column, to a normal money format so no stale formatting survives the column
+  // shift. W is the new home for the date and gets the actual date format.
+  const MONEY_FORMAT = "#,##0.00";
+  const numberColumns = ["S", "T", "U", "V", "X", "Y"];
+  for (const col of numberColumns) {
+    await setRangeNumberFormat(EXCEL_DRIVE_ID, EXCEL_ITEM_ID, WORKSHEET, `${col}2:${col}3`, [
+      [MONEY_FORMAT],
+      [MONEY_FORMAT],
+    ]);
+  }
   await setRangeNumberFormat(EXCEL_DRIVE_ID, EXCEL_ITEM_ID, WORKSHEET, "W2:W3", [
     [dateNumberFormat],
     [dateNumberFormat],
   ]);
 
-  console.log(`\n✅ Wrote headers + formulas to Q1:Y3 on "${WORKSHEET}" (W2:W3 formatted as dates).`);
+  console.log(
+    `\n✅ Wrote headers + formulas to Q1:Y3 on "${WORKSHEET}" (S:U/V/X:Y formatted as numbers, W2:W3 formatted as dates).`
+  );
 
   const after = await getRangeFormulas(EXCEL_DRIVE_ID, EXCEL_ITEM_ID, WORKSHEET, "Q1:Y3");
   console.log("Resulting Q1:Y3 formulas/values:", JSON.stringify(after.formulas));
