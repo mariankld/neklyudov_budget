@@ -1324,21 +1324,30 @@ async function appendTransactionToExcel(draft) {
 }
 
 /**
- * Powers the /staff command (Mariya, 2026-09-15). Reads StaffAdvances and StaffExpenses in full
- * and, for each of STAFF_MEMBERS, computes: total advances (HKD), total spent (HKD), remaining
- * balance, and the most recent advance's amount + date.
+ * Powers the /staff command (Mariya, 2026-09-15, revised 2026-09-16). Reads StaffAdvances and
+ * StaffExpenses in full and, for each of STAFF_MEMBERS, computes a *period* balance — not a
+ * lifetime running total: the amount of their most recent advance, how much they've spent since
+ * that advance's date, and what's left (lastAdvanceAmount - spentSinceLastAdvance). A lifetime
+ * total ("all advances ever minus all spending ever") kept drifting from what Mariya actually
+ * wanted to know, which is "what's left from what I just gave them."
  *
  * "Most recent advance" per Mariya's explicit instruction ("treat each dated entry as its own
  * advance"): every distinct date on which that person has StaffAdvances rows is one advance
  * event; if a single advance was paid out via several receipts on the same day, those rows are
- * summed together as one event. The event with the latest date is "the most recent advance", and
- * its amount is the sum of every StaffAdvances row for that person dated exactly that day — this
- * mirrors the U2/V2 formulas written to the "Staff Advances" worksheet by
- * scripts/add-staff-balance-formulas.js, so the bot and the live spreadsheet always agree.
+ * summed together as one event. The event with the latest date is "the most recent advance."
  *
- * Yaya's numbers are converted to THB (today's rate) for display in the /staff reply only — see
- * the comment above the STAFF_MEMBERS.map() loop below. The Excel Q:V formula block is untouched
- * and still reports everyone in HKD.
+ * Currency, per Mariya (2026-09-16): Yaya is always paid and spends in THB, so her numbers come
+ * straight from the raw Сумма column (STANDARD_CAT_COLS.amount) on rows tagged Валюта=THB — no FX
+ * conversion at all. Converting her HKD-ledger total back to THB using *today's* rate would drift
+ * from the actual baht figures Mariya handed over/received, which is exactly what caused the
+ * earlier "the calculations still don't seem right" mismatch. Any StaffAdvances/StaffExpenses row
+ * for Yaya not tagged THB is excluded from her totals and flagged in the /staff reply so Mariya can
+ * fix the row's currency tag. Marietta is paid and tracked in HKD, so hers keeps using
+ * Сумма (HKD) as before.
+ *
+ * The Excel "Staff Advances"/"Staff Spending" worksheets (scripts/add-staff-balance-formulas.js)
+ * separately show BOTH the lifetime totals and this same period-based balance side by side — this
+ * function only powers the Telegram /staff reply, which shows the period balance only.
  */
 async function getStaffBalancesReport() {
   const driveId = getExcelDriveIdFromEnv();
@@ -1349,72 +1358,78 @@ async function getStaffBalancesReport() {
     getTableRows(driveId, itemId, CATEGORY_TABLE_MAP["Staff Spending"]),
   ]);
 
-  // /staff shows Yaya's numbers in THB (today's rate) since baht is what actually gets handed to
-  // her and what she spends — easier for Mariya to sanity-check at a glance. This is display-only:
-  // the underlying ledger (StaffAdvances/StaffExpenses, Сумма (HKD), and the Q:V Excel formulas)
-  // stays in HKD for everyone exactly as before; only this Telegram message's numbers for Yaya get
-  // converted. Marietta is unaffected. Mariya, 2026-09-16.
-  const todayDdMmYyyy = formatDateDdMmYyyy(new Date());
+  return STAFF_MEMBERS.map((name) => {
+    const currency = name === "Yaya" ? "THB" : "HKD";
 
-  return Promise.all(
-    STAFF_MEMBERS.map(async (name) => {
-      let totalAdvances = 0;
-      let totalSpent = 0;
-      // dateKey (ms since epoch) -> summed HKD amount for that day's advance(s)
-      const advancesByDay = new Map();
+    // For Yaya (THB), pull the raw Сумма amount from rows tagged Валюта=THB; any row for her not
+    // tagged THB is skipped and counted so the reply can flag it. For everyone else, use the
+    // already-frozen Сумма (HKD) column — no filtering needed.
+    function amountFor(row) {
+      if (currency !== "THB") return { amount: Number(row[STANDARD_CAT_COLS.sumHkd]) || 0, skipped: false };
+      const rowCurrency = String(row[STANDARD_CAT_COLS.currency] || "").trim().toUpperCase();
+      if (rowCurrency !== "THB") return { amount: 0, skipped: true };
+      return { amount: Number(row[STANDARD_CAT_COLS.amount]) || 0, skipped: false };
+    }
 
-      for (const row of advanceRows) {
-        if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
-        const amount = Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
-        totalAdvances += amount;
+    // dateKey (ms since epoch) -> summed amount (in `currency`) for that day's advance(s)
+    const advancesByDay = new Map();
+    let skippedRows = 0;
 
-        const date = parseCellDate(row[STANDARD_CAT_COLS.date]);
-        if (!date) continue;
-        const dateKey = date.getTime();
-        advancesByDay.set(dateKey, {
-          date,
-          amount: (advancesByDay.get(dateKey)?.amount || 0) + amount,
-        });
+    for (const row of advanceRows) {
+      if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
+      const { amount, skipped } = amountFor(row);
+      if (skipped) {
+        skippedRows += 1;
+        continue;
       }
 
+      const date = parseCellDate(row[STANDARD_CAT_COLS.date]);
+      if (!date) continue;
+      const dateKey = date.getTime();
+      advancesByDay.set(dateKey, {
+        date,
+        amount: (advancesByDay.get(dateKey)?.amount || 0) + amount,
+      });
+    }
+
+    let lastAdvance = null;
+    for (const entry of advancesByDay.values()) {
+      if (!lastAdvance || entry.date.getTime() > lastAdvance.date.getTime()) {
+        lastAdvance = entry;
+      }
+    }
+
+    // "Spent since last advance": every StaffExpenses row for this person dated on or after the
+    // last advance's date. With no advance on record yet there's no period to measure against, so
+    // this (and remaining) stay null rather than silently summing *all* historical spending —
+    // which is what an unguarded "date >= 0" comparison would otherwise do.
+    let spentSinceLastAdvance = null;
+    if (lastAdvance) {
+      spentSinceLastAdvance = 0;
       for (const row of spendingRows) {
         if (findKnownStaffMember(row[STANDARD_CAT_COLS.recipient]) !== name) continue;
-        totalSpent += Number(row[STANDARD_CAT_COLS.sumHkd]) || 0;
-      }
-
-      let lastAdvance = null;
-      for (const entry of advancesByDay.values()) {
-        if (!lastAdvance || entry.date.getTime() > lastAdvance.date.getTime()) {
-          lastAdvance = entry;
+        const { amount, skipped } = amountFor(row);
+        if (skipped) {
+          skippedRows += 1;
+          continue;
         }
+        const date = parseCellDate(row[STANDARD_CAT_COLS.date]);
+        if (!date || date.getTime() < lastAdvance.date.getTime()) continue;
+        spentSinceLastAdvance += amount;
       }
+    }
 
-      // Convert this person's totals from HKD into their /staff display currency. Only Yaya
-      // converts (to THB, using today's rate); everyone else displays in HKD unchanged. A failed
-      // rate lookup falls back to HKD rather than blocking the whole /staff reply.
-      let displayCurrency = "HKD";
-      let toDisplay = (n) => n;
-      if (name === "Yaya") {
-        try {
-          const hkdPerThb = await fxRates.getRateToHkd("THB", todayDdMmYyyy);
-          displayCurrency = "THB";
-          toDisplay = (n) => n / hkdPerThb;
-        } catch (err) {
-          console.error("getStaffBalancesReport: THB rate lookup failed, showing Yaya in HKD instead:", err.message);
-        }
-      }
-
-      return {
-        name,
-        currency: displayCurrency,
-        totalAdvances: roundMoney(toDisplay(totalAdvances)),
-        totalSpent: roundMoney(toDisplay(totalSpent)),
-        remaining: roundMoney(toDisplay(totalAdvances - totalSpent)),
-        lastAdvanceAmount: lastAdvance ? roundMoney(toDisplay(lastAdvance.amount)) : null,
-        lastAdvanceDateLabel: lastAdvance ? formatCellDateDdMmYyyy(lastAdvance.date) : null,
-      };
-    })
-  );
+    return {
+      name,
+      currency,
+      lastAdvanceAmount: lastAdvance ? roundMoney(lastAdvance.amount) : null,
+      lastAdvanceDateLabel: lastAdvance ? formatCellDateDdMmYyyy(lastAdvance.date) : null,
+      spentSinceLastAdvance: spentSinceLastAdvance != null ? roundMoney(spentSinceLastAdvance) : null,
+      remaining:
+        lastAdvance && spentSinceLastAdvance != null ? roundMoney(lastAdvance.amount - spentSinceLastAdvance) : null,
+      skippedNonThbRows: skippedRows,
+    };
+  });
 }
 
 function formatStaffMoney(n) {
@@ -1425,11 +1440,20 @@ function formatStaffMoney(n) {
 function formatStaffBalancesMessage(report) {
   const lines = ["💰 Staff Balances", ""];
   for (const r of report) {
-    const lastAdvanceLine =
-      r.lastAdvanceAmount != null
-        ? `Last advance: ${r.currency} ${formatStaffMoney(r.lastAdvanceAmount)} on ${r.lastAdvanceDateLabel}`
-        : "Last advance: —";
-    lines.push(`${r.name}:`, `  Remaining: ${r.currency} ${formatStaffMoney(r.remaining)}`, `  ${lastAdvanceLine}`, "");
+    if (!r.lastAdvanceAmount) {
+      lines.push(`${r.name}:`, "  No advance on record yet", "");
+      continue;
+    }
+    lines.push(
+      `${r.name}:`,
+      `  Remaining: ${r.currency} ${formatStaffMoney(r.remaining)}`,
+      `  Last advance: ${r.currency} ${formatStaffMoney(r.lastAdvanceAmount)} on ${r.lastAdvanceDateLabel}`,
+      `  Spent since: ${r.currency} ${formatStaffMoney(r.spentSinceLastAdvance)}`
+    );
+    if (r.skippedNonThbRows > 0) {
+      lines.push(`  ⚠️ ${r.skippedNonThbRows} row(s) not tagged THB were excluded — check currency tags`);
+    }
+    lines.push("");
   }
   return lines.join("\n").trim();
 }
